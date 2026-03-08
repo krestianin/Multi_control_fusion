@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-
+from diffusers import DDIMScheduler
 from transformers import pipeline
 
 from models import load_models
@@ -17,9 +17,9 @@ def load_rgb_image(image_path: str, size: int = 512) -> Image.Image:
     return image
 
 
-def make_canny_control(image: Image.Image) -> Image.Image:
+def make_canny_control(image: Image.Image, low_threshold: int = 100, high_threshold: int = 200) -> Image.Image:
     np_img = np.array(image)
-    edges = cv2.Canny(np_img, 100, 200)
+    edges = cv2.Canny(np_img, low_threshold, high_threshold)
     edges_3ch = np.stack([edges, edges, edges], axis=-1)
     return Image.fromarray(edges_3ch)
 
@@ -33,19 +33,27 @@ def make_depth_control(image: Image.Image, depth_pipe) -> Image.Image:
 
     depth_img = depth_img.convert("L")
     depth_img = depth_img.resize(image.size)
+
     depth_np = np.array(depth_img)
     depth_3ch = np.stack([depth_np, depth_np, depth_np], axis=-1)
     return Image.fromarray(depth_3ch.astype(np.uint8))
 
 
-def pil_to_tensor(image: Image.Image, device: str, dtype: torch.dtype) -> torch.Tensor:
+def pil_to_tensor_01(image: Image.Image, device: str, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Converts PIL image to tensor in [0, 1], shape [1, 3, H, W]
+    """
     arr = np.array(image).astype(np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))  # HWC -> CHW
     tensor = torch.from_numpy(arr).unsqueeze(0).to(device=device, dtype=dtype)
     return tensor
 
 
-def encode_prompt(prompt: str, tokenizer, text_encoder, device: str):
+def encode_prompt(prompt: str, tokenizer, text_encoder, device: str, do_cfg: bool = True):
+    """
+    Returns encoder_hidden_states.
+    If do_cfg=True, returns concatenated unconditional + conditional embeddings.
+    """
     text_inputs = tokenizer(
         prompt,
         padding="max_length",
@@ -56,31 +64,65 @@ def encode_prompt(prompt: str, tokenizer, text_encoder, device: str):
     input_ids = text_inputs.input_ids.to(device)
 
     with torch.no_grad():
-        encoder_hidden_states = text_encoder(input_ids)[0]
+        cond_embeds = text_encoder(input_ids)[0]
 
-    return encoder_hidden_states
+    if not do_cfg:
+        return cond_embeds
 
-
-def encode_image_to_latent(image: Image.Image, vae, device: str, dtype: torch.dtype) -> torch.Tensor:
-    img = np.array(image).astype(np.float32) / 255.0
-    img = (img * 2.0) - 1.0  # [0,1] -> [-1,1]
-    img = np.transpose(img, (2, 0, 1))
-    img_tensor = torch.from_numpy(img).unsqueeze(0).to(device=device, dtype=dtype)
+    uncond_inputs = tokenizer(
+        "",
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    uncond_ids = uncond_inputs.input_ids.to(device)
 
     with torch.no_grad():
-        latents = vae.encode(img_tensor).latent_dist.sample()
-        latents = latents * vae.config.scaling_factor
+        uncond_embeds = text_encoder(uncond_ids)[0]
 
-    return latents
+    return torch.cat([uncond_embeds, cond_embeds], dim=0)
+
+
+def decode_latents(latents: torch.Tensor, vae) -> Image.Image:
+    """
+    Decode final latents to PIL image.
+    """
+    with torch.no_grad():
+        latents = latents / vae.config.scaling_factor
+        image = vae.decode(latents).sample
+
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image.detach().cpu().permute(0, 2, 3, 1).float().numpy()
+    image = (image[0] * 255).round().astype(np.uint8)
+    return Image.fromarray(image)
 
 
 def main():
-    image_path = "input.jpg"   # replace with your image
-    prompt = "a realistic street scene"
+    # -----------------------------
+    # User settings
+    # -----------------------------
+    image_path = "controller.png"   # replace with your control/source image
+    prompt = "a realistic cinematic street scene"
+    output_path = "generated_equal_fusion.png"
 
+    num_inference_steps = 30
+    guidance_scale = 7.5
+    height = 512
+    width = 512
+
+    # -----------------------------
+    # Device / dtype
+    # -----------------------------
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
 
+    print(f"Using device: {device}")
+    print(f"Using dtype:  {dtype}")
+
+    # -----------------------------
+    # Load base models
+    # -----------------------------
     parts = load_models(device=device, dtype=dtype)
 
     fusion = EqualWeightMultiControlFusion(
@@ -90,12 +132,24 @@ def main():
         depth_weight=0.5,
     ).to(device)
 
-    # Load real input image
+    # -----------------------------
+    # Load scheduler
+    # -----------------------------
+    scheduler = DDIMScheduler.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        subfolder="scheduler",
+    )
+    scheduler.set_timesteps(num_inference_steps, device=device)
+
+    # -----------------------------
+    # Load image and build controls
+    # -----------------------------
     image = load_rgb_image(image_path, size=512)
 
-    # Build real control maps
+    print("Computing Canny control...")
     canny_image = make_canny_control(image)
 
+    print("Computing Depth control...")
     depth_pipe = pipeline(
         task="depth-estimation",
         model="Intel/dpt-large",
@@ -103,58 +157,83 @@ def main():
     )
     depth_image = make_depth_control(image, depth_pipe)
 
-    # Convert control maps to tensors
-    canny_cond = pil_to_tensor(canny_image, device=device, dtype=dtype)
-    depth_cond = pil_to_tensor(depth_image, device=device, dtype=dtype)
+    canny_cond = pil_to_tensor_01(canny_image, device=device, dtype=dtype)
+    depth_cond = pil_to_tensor_01(depth_image, device=device, dtype=dtype)
 
-    # Real prompt encoding
+    # classifier-free guidance duplicates the batch
+    canny_cond = torch.cat([canny_cond, canny_cond], dim=0)
+    depth_cond = torch.cat([depth_cond, depth_cond], dim=0)
+
+    # -----------------------------
+    # Encode prompt
+    # -----------------------------
     encoder_hidden_states = encode_prompt(
-        prompt,
+        prompt=prompt,
         tokenizer=parts["tokenizer"],
         text_encoder=parts["text_encoder"],
         device=device,
+        do_cfg=True,
     )
 
-    # Real latent from real image
-    latents = encode_image_to_latent(
-        image=image,
-        vae=parts["vae"],
-        device=device,
-        dtype=dtype,
-    )
+    # -----------------------------
+    # Initialize random latents
+    # -----------------------------
+    latent_h = height // 8
+    latent_w = width // 8
+    latents = torch.randn((1, 4, latent_h, latent_w), device=device, dtype=dtype)
+    latents = latents * scheduler.init_noise_sigma
 
-    # Add one diffusion step of noise
-    noise = torch.randn_like(latents)
-    timestep = torch.tensor([500], device=device, dtype=torch.long)
-    alpha = 0.5
-    noisy_latents = alpha * latents + (1 - alpha) * noise
+    # -----------------------------
+    # Denoising loop
+    # -----------------------------
+    print("Running denoising loop...")
+    for step_idx, t in enumerate(scheduler.timesteps):
+        # Duplicate latents for CFG: [uncond, cond]
+        latent_model_input = torch.cat([latents, latents], dim=0)
+        latent_model_input = scheduler.scale_model_input(latent_model_input, t)
 
-    # Run your fusion module
-    with torch.no_grad():
-        fused = fusion(
-            sample=noisy_latents,
-            timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            canny_cond=canny_cond,
-            depth_cond=depth_cond,
-        )
+        # Run your equal-weight fusion module
+        with torch.no_grad():
+            fused = fusion(
+                sample=latent_model_input,
+                timestep=t,
+                encoder_hidden_states=encoder_hidden_states,
+                canny_cond=canny_cond,
+                depth_cond=depth_cond,
+            )
 
-    print("Number of fused down residuals:", len(fused.down_block_res_samples))
-    print("Mid residual shape:", fused.mid_block_res_sample.shape)
+            # Run U-Net with fused residuals
+            noise_pred = parts["unet"](
+                sample=latent_model_input,
+                timestep=t,
+                encoder_hidden_states=encoder_hidden_states,
+                down_block_additional_residuals=fused.down_block_res_samples,
+                mid_block_additional_residual=fused.mid_block_res_sample,
+                return_dict=True,
+            ).sample
 
-    # Run real U-Net pass
-    with torch.no_grad():
-        unet_out = parts["unet"](
-            sample=noisy_latents,
-            timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            down_block_additional_residuals=fused.down_block_res_samples,
-            mid_block_additional_residual=fused.mid_block_res_sample,
-            return_dict=True,
-        )
+        # Classifier-free guidance
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-    print("U-Net output shape:", unet_out.sample.shape)
-    print("Real single-step forward pass completed successfully.")
+        # Scheduler step
+        latents = scheduler.step(noise_pred, t, latents).prev_sample
+
+        print(f"Step {step_idx + 1}/{num_inference_steps} done")
+
+    # -----------------------------
+    # Decode final latents
+    # -----------------------------
+    print("Decoding final image...")
+    result = decode_latents(latents, parts["vae"])
+    result.save(output_path)
+
+    # Optional: save controls too
+    canny_image.save("debug_canny.png")
+    depth_image.save("debug_depth.png")
+
+    print(f"Saved generated image to: {output_path}")
+    print("Done.")
 
 
 if __name__ == "__main__":
