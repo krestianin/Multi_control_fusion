@@ -8,7 +8,7 @@ from diffusers import DDIMScheduler
 from transformers import pipeline
 
 from models import load_models
-from multi_control_fusion import EqualWeightMultiControlFusion
+from multi_control_fusion import LearnedWeightMultiControlFusion
 
 
 def load_rgb_image(image_path: str, size: int = 512) -> Image.Image:
@@ -102,9 +102,10 @@ def main():
     # -----------------------------
     # User settings
     # -----------------------------
-    image_path = "controller.png"   # replace with your control/source image
+    image_path = "village.png"   # replace with your control/source image
     prompt = "a realistic cinematic street scene"
     output_path = "generated_equal_fusion.png"
+    fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_best.pth"  # set to None to fall back to fixed weights
 
     num_inference_steps = 30
     guidance_scale = 7.5
@@ -125,12 +126,21 @@ def main():
     # -----------------------------
     parts = load_models(device=device, dtype=dtype)
 
-    fusion = EqualWeightMultiControlFusion(
+    fusion = LearnedWeightMultiControlFusion(
         canny_controlnet=parts["canny_controlnet"],
         depth_controlnet=parts["depth_controlnet"],
-        canny_weight=0.5,
-        depth_weight=0.5,
+        fusion_mlp_path=None,
+        map_location=device,
+        temperature=1.0,
+        fallback_canny_weight=0.5,
+        fallback_depth_weight=0.5,
+        validate_shapes_once=True,
     ).to(device)
+
+    print(
+        "Fusion mode:",
+        "learned MLP" if fusion.has_learned_fusion() else "fixed fallback weights",
+    )
 
     # -----------------------------
     # Load scheduler
@@ -188,11 +198,9 @@ def main():
     # -----------------------------
     print("Running denoising loop...")
     for step_idx, t in enumerate(scheduler.timesteps):
-        # Duplicate latents for CFG: [uncond, cond]
         latent_model_input = torch.cat([latents, latents], dim=0)
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
 
-        # Run your equal-weight fusion module
         with torch.no_grad():
             fused = fusion(
                 sample=latent_model_input,
@@ -202,7 +210,6 @@ def main():
                 depth_cond=depth_cond,
             )
 
-            # Run U-Net with fused residuals
             noise_pred = parts["unet"](
                 sample=latent_model_input,
                 timestep=t,
@@ -212,12 +219,15 @@ def main():
                 return_dict=True,
             ).sample
 
-        # Classifier-free guidance
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-        # Scheduler step
         latents = scheduler.step(noise_pred, t, latents).prev_sample
+
+        if step_idx == 0 and fused.fusion_weights is not None:
+            weights_cpu = fused.fusion_weights.detach().float().cpu()
+            print("Learned per-layer fusion weights:")
+            for j, pair in enumerate(weights_cpu):
+                print(f"  layer {j:02d}: canny={pair[0]:.4f}, depth={pair[1]:.4f}")
 
         print(f"Step {step_idx + 1}/{num_inference_steps} done")
 
@@ -228,7 +238,6 @@ def main():
     result = decode_latents(latents, parts["vae"])
     result.save(output_path)
 
-    # Optional: save controls too
     canny_image.save("debug_canny.png")
     depth_image.save("debug_depth.png")
 
