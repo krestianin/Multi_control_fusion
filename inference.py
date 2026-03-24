@@ -104,7 +104,7 @@ def main():
     # -----------------------------
     image_path = "village.png"   # replace with your control/source image
     prompt = "a realistic cinematic street scene"
-    output_path = "generated_equal_fusion.png"
+    output_path = "generated_learned_fusion.png"
     fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_best.pth"  # set to None to fall back to fixed weights
 
     num_inference_steps = 30
@@ -129,7 +129,7 @@ def main():
     fusion = LearnedWeightMultiControlFusion(
         canny_controlnet=parts["canny_controlnet"],
         depth_controlnet=parts["depth_controlnet"],
-        fusion_mlp_path=None,
+        fusion_mlp_path=fusion_mlp_path,
         map_location=device,
         temperature=1.0,
         fallback_canny_weight=0.5,
