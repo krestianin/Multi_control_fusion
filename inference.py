@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from diffusers import DDIMScheduler
+from diffusers import DDPMScheduler
 from transformers import pipeline
 
 from models import load_models
@@ -102,12 +102,12 @@ def main():
     # -----------------------------
     # User settings
     # -----------------------------
-    image_path = "village.png"   # replace with your control/source image
-    prompt = "a realistic cinematic street scene"
-    output_path = "generated_learned_fusion.png"
-    fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_best.pth"  # set to None to fall back to fixed weights
+    image_path = "soldier.png"   # replace with your control/source image
+    prompt = "walking soldiers, one with a guitar"  
+    output_path = "last_model_soldier.png"
+    fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_last.pth"  # set to None to fall back to fixed weights
 
-    num_inference_steps = 30
+    num_inference_steps = 999
     guidance_scale = 7.5
     height = 512
     width = 512
@@ -145,7 +145,7 @@ def main():
     # -----------------------------
     # Load scheduler
     # -----------------------------
-    scheduler = DDIMScheduler.from_pretrained(
+    scheduler = DDPMScheduler.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
         subfolder="scheduler",
     )

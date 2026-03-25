@@ -1,125 +1,67 @@
 from __future__ import annotations
 
-import csv
 import random
+
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
-import cv2
-import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from diffusers import DDIMScheduler
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from transformers import pipeline
 
 from fusion_mlp import PerLayerFusionMLP
-from models import load_models
+from models import load_training_models
 
 
 # -----------------------------
-# Simple dataset
+# Dataset (pre-computed tensors)
 # -----------------------------
-class ImageCaptionDataset(Dataset):
+class PrecomputedDataset(Dataset):
     """
-    CSV format:
-        image_path,caption
-
-    Keep it simple first. You can swap this for a Hugging Face dataset later.
+    Scans pt_dir for all *_latent.pt files and expects matching:
+        pt/{stem}_canny.pt
+        pt/{stem}_depth.pt
+        pt/{stem}_latent.pt
+        pt/{stem}_text_emb.pt
+    No CSV needed.
     """
 
-    def __init__(self, csv_path: str | Path, image_size: int = 512) -> None:
-        self.image_size = image_size
-        self.samples: list[tuple[str, str]] = []
+    def __init__(self, pt_dir: str | Path = "pt") -> None:
+        pt_dir = Path(pt_dir)
+        self.samples: list[tuple[Path, Path, Path, Path]] = []
 
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                self.samples.append((row["image_path"], row["caption"]))
+        for latent_path in sorted(pt_dir.glob("*_latent.pt")):
+            stem = latent_path.stem[: -len("_latent")]
+            canny    = pt_dir / f"{stem}_canny.pt"
+            depth    = pt_dir / f"{stem}_depth.pt"
+            text_emb = pt_dir / f"{stem}_text_emb.pt"
+            missing  = [p for p in (canny, depth, text_emb) if not p.exists()]
+            if missing:
+                raise FileNotFoundError(f"Missing for stem '{stem}': {missing}")
+            self.samples.append((canny, depth, latent_path, text_emb))
 
         if not self.samples:
-            raise ValueError("Dataset is empty")
+            raise ValueError(f"No *_latent.pt files found in {pt_dir}")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        image_path, caption = self.samples[idx]
-        image = Image.open(image_path).convert("RGB")
-        image = image.resize((self.image_size, self.image_size), Image.Resampling.LANCZOS)
-        return image, caption
+        canny_path, depth_path, latent_path, emb_path = self.samples[idx]
+        return (
+            torch.load(canny_path, weights_only=True),    # [3, H, W]
+            torch.load(depth_path, weights_only=True),    # [3, H, W]
+            torch.load(latent_path, weights_only=True),   # [4, 64, 64]
+            torch.load(emb_path, weights_only=True),      # [77, 768]
+        )
 
 
-def collate_pil(batch):
-    images, captions = zip(*batch)
-    return list(images), list(captions)
-
-
-# -----------------------------
-# Controls / text / image utils
-# -----------------------------
-def make_canny_control(
-    image: Image.Image,
-    low_threshold: int = 100,
-    high_threshold: int = 200,
-) -> Image.Image:
-    np_img = np.array(image)
-    edges = cv2.Canny(np_img, low_threshold, high_threshold)
-    edges_3ch = np.stack([edges, edges, edges], axis=-1)
-    return Image.fromarray(edges_3ch)
-
-
-def make_depth_control(image: Image.Image, depth_pipe) -> Image.Image:
-    depth_result = depth_pipe(image)
-    depth_img = depth_result["depth"]
-
-    if not isinstance(depth_img, Image.Image):
-        depth_img = Image.fromarray(np.array(depth_img))
-
-    depth_img = depth_img.convert("L")
-    depth_img = depth_img.resize(image.size, Image.Resampling.BILINEAR)
-    depth_np = np.array(depth_img)
-    depth_3ch = np.stack([depth_np, depth_np, depth_np], axis=-1)
-    return Image.fromarray(depth_3ch.astype(np.uint8))
-
-
-def pil_to_tensor_01(images: Sequence[Image.Image], device: str, dtype: torch.dtype) -> torch.Tensor:
-    arrs = []
-    for image in images:
-        arr = np.asarray(image, dtype=np.float32) / 255.0
-        arr = np.transpose(arr, (2, 0, 1))
-        arrs.append(arr)
-    tensor = torch.from_numpy(np.stack(arrs, axis=0)).to(device=device, dtype=dtype)
-    return tensor
-
-
-def pil_to_latent_tensor(images: Sequence[Image.Image], device: str, dtype: torch.dtype) -> torch.Tensor:
-    arrs = []
-    for image in images:
-        arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
-        arr = np.transpose(arr, (2, 0, 1))
-        arrs.append(arr)
-    return torch.from_numpy(np.stack(arrs, axis=0)).to(device=device, dtype=dtype)
-
-
-def encode_prompt_batch(
-    prompts: Sequence[str],
-    tokenizer,
-    text_encoder,
-    device: str,
-) -> torch.Tensor:
-    text_inputs = tokenizer(
-        list(prompts),
-        padding="max_length",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
-    input_ids = text_inputs.input_ids.to(device)
-    return text_encoder(input_ids)[0]
+def collate_fn(batch):
+    cannys, depths, latents, text_embs = zip(*batch)
+    return torch.stack(cannys), torch.stack(depths), torch.stack(latents), torch.stack(text_embs)
 
 
 # -----------------------------
@@ -211,16 +153,16 @@ class LearnedPerLayerFusion(nn.Module):
 # -----------------------------
 @dataclass
 class TrainConfig:
-    train_csv: str = "train.csv"
     output_dir: str = "fusion_mlp_ckpts"
-    image_size: int = 512
-    batch_size: int = 1
+    batch_size: int = 1          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
+    gradient_accumulation_steps: int = 8   # effective batch = batch_size × accum_steps
     epochs: int = 1
-    lr: float = 1e-3
+    lr: float = 1e-3             # ok since only the tiny fusion MLP is trained
     weight_decay: float = 1e-4
-    num_inference_train_timesteps: int = 1000
+    pt_dir: str = "pt"
+    # num_inference_train_timesteps: int = 1000   # only 1 random t sampled per step — cost is fine
     max_grad_norm: float = 1.0
-    save_every_steps: int = 200
+    save_every_steps: int = 500   # counted in optimizer steps (post-accumulation)
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -259,7 +201,7 @@ def train(cfg: TrainConfig) -> None:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    parts = load_models(device=cfg.device, dtype=cfg.dtype)
+    parts = load_training_models(device=cfg.device, dtype=cfg.dtype)
     num_points = discover_num_injection_points(parts, cfg.device, cfg.dtype)
 
     fusion_mlp = PerLayerFusionMLP(
@@ -276,6 +218,9 @@ def train(cfg: TrainConfig) -> None:
         fusion_mlp=fusion_mlp,
     ).to(cfg.device)
 
+    print("Initial weights (before any training):")
+    fusion_mlp.pretty_print()
+
     optimizer = torch.optim.AdamW(
         fusion_mlp.parameters(),
         lr=cfg.lr,
@@ -286,51 +231,36 @@ def train(cfg: TrainConfig) -> None:
         "runwayml/stable-diffusion-v1-5",
         subfolder="scheduler",
     )
-    scheduler.set_timesteps(cfg.num_inference_train_timesteps, device=cfg.device)
+    # scheduler.set_timesteps(cfg.num_inference_train_timesteps, device=cfg.device)
 
-    dataset = ImageCaptionDataset(cfg.train_csv, image_size=cfg.image_size)
+    dataset = PrecomputedDataset(pt_dir=cfg.pt_dir)
     loader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=0,
-        collate_fn=collate_pil,
+        num_workers=2,
+        collate_fn=collate_fn,
     )
 
-    depth_pipe = pipeline(
-        task="depth-estimation",
-        model="Intel/dpt-large",
-        device=0 if cfg.device == "cuda" else -1,
-    )
-
-    global_step = 0
+    global_step = 0          # counts optimizer steps (post-accumulation)
+    accum_step = 0           # counts micro-batches within the current accumulation window
+    accum_loss = 0.0         # running sum for logging
     best_loss = float("inf")
+
+    optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(cfg.epochs):
         fusion_mlp.train()
+        epoch_loss_sum = 0.0
+        epoch_optimizer_steps = 0
 
-        for images, captions in loader:
-            batch_size = len(images)
+        for canny_cond, depth_cond, latents, text_embs in loader:
+            batch_size = latents.shape[0]
 
-            # Build controls on the fly for now.
-            canny_images = [make_canny_control(img) for img in images]
-            depth_images = [make_depth_control(img, depth_pipe) for img in images]
-
-            pixel_values = pil_to_latent_tensor(images, device=cfg.device, dtype=cfg.dtype)
-            canny_cond = pil_to_tensor_01(canny_images, device=cfg.device, dtype=cfg.dtype)
-            depth_cond = pil_to_tensor_01(depth_images, device=cfg.device, dtype=cfg.dtype)
-
-            encoder_hidden_states = encode_prompt_batch(
-                prompts=captions,
-                tokenizer=parts["tokenizer"],
-                text_encoder=parts["text_encoder"],
-                device=cfg.device,
-            )
-
-            # Encode image to latent z0.
-            with torch.no_grad():
-                latents = parts["vae"].encode(pixel_values).latent_dist.sample()
-                latents = latents * parts["vae"].config.scaling_factor
+            canny_cond            = canny_cond.to(device=cfg.device, dtype=cfg.dtype)
+            depth_cond            = depth_cond.to(device=cfg.device, dtype=cfg.dtype)
+            latents               = latents.to(device=cfg.device, dtype=cfg.dtype)
+            encoder_hidden_states = text_embs.to(device=cfg.device, dtype=cfg.dtype)
 
             noise = torch.randn_like(latents)
             timesteps = torch.randint(
@@ -359,28 +289,41 @@ def train(cfg: TrainConfig) -> None:
                 return_dict=True,
             ).sample
 
+            # Divide loss so that the sum over accumulation steps ≈ a single
+            # large-batch loss (same scale regardless of accum window size).
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+            (loss / cfg.gradient_accumulation_steps).backward()
+            accum_loss += loss.item()
+            accum_step += 1
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(fusion_mlp.parameters(), cfg.max_grad_norm)
-            optimizer.step()
+            if accum_step % cfg.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(fusion_mlp.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            global_step += 1
+                global_step += 1
+                avg_loss = accum_loss / cfg.gradient_accumulation_steps
+                epoch_loss_sum += avg_loss
+                epoch_optimizer_steps += 1
+                accum_loss = 0.0
 
-            print(
-                f"epoch={epoch + 1}/{cfg.epochs} "
-                f"step={global_step} "
-                f"loss={loss.item():.6f}"
-            )
+                print(
+                    f"epoch={epoch + 1}/{cfg.epochs} "
+                    f"opt_step={global_step} "
+                    f"loss={avg_loss:.6f}"
+                )
 
-            if loss.item() < best_loss:
-                best_loss = loss.item()
-                fusion_mlp.save(output_dir / "fusion_mlp_best.pth")
+                # if avg_loss < best_loss:
+                #     best_loss = avg_loss
+                #     fusion_mlp.save(output_dir / "fusion_mlp_best.pth")
 
-            if global_step % cfg.save_every_steps == 0:
-                fusion_mlp.save(output_dir / f"fusion_mlp_step_{global_step}.pth")
+                if global_step % cfg.save_every_steps == 0:
+                    fusion_mlp.save(output_dir / f"fusion_mlp_step_{global_step}.pth")
 
+        print(f"\n--- epoch {epoch + 1} summary ---")
+        print(f"avg loss: {epoch_loss_sum / max(epoch_optimizer_steps, 1):.6f}")
+        print("weights after this epoch:")
+        fusion_mlp.pretty_print()
         fusion_mlp.save(output_dir / f"fusion_mlp_epoch_{epoch + 1}.pth")
 
     fusion_mlp.save(output_dir / "fusion_mlp_last.pth")
