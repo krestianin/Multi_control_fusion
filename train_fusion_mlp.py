@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import time
 
 import numpy as np
 from dataclasses import dataclass
@@ -154,7 +155,7 @@ class LearnedPerLayerFusion(nn.Module):
 @dataclass
 class TrainConfig:
     output_dir: str = "fusion_mlp_ckpts"
-    batch_size: int = 1          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
+    batch_size: int = 8          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
     gradient_accumulation_steps: int = 8   # effective batch = batch_size × accum_steps
     epochs: int = 1
     lr: float = 1e-3             # ok since only the tiny fusion MLP is trained
@@ -166,6 +167,7 @@ class TrainConfig:
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    max_batches: int | None = 500  # set to None to disable; 50 for a quick profiling run
 
 
 # -----------------------------
@@ -247,6 +249,15 @@ def train(cfg: TrainConfig) -> None:
     accum_loss = 0.0         # running sum for logging
     best_loss = float("inf")
 
+    # ----- profiling timers (seconds, accumulated across batches) -----
+    use_cuda = cfg.device == "cuda"
+    _T = {"dataloader": 0.0, "to_device": 0.0, "fusion": 0.0, "unet": 0.0, "backward_optim": 0.0}
+    batches_timed = 0
+
+    def _sync():
+        if use_cuda:
+            torch.cuda.synchronize()
+
     optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(cfg.epochs):
@@ -254,13 +265,30 @@ def train(cfg: TrainConfig) -> None:
         epoch_loss_sum = 0.0
         epoch_optimizer_steps = 0
 
-        for canny_cond, depth_cond, latents, text_embs in loader:
-            batch_size = latents.shape[0]
+        loader_iter = iter(loader)
+        while True:
+            # ── 1. DataLoader fetch ──────────────────────────────────────
+            _sync()
+            t0 = time.perf_counter()
+            try:
+                canny_cond, depth_cond, latents, text_embs = next(loader_iter)
+            except StopIteration:
+                break
+            _sync()
+            _T["dataloader"] += time.perf_counter() - t0
 
+            batch_size = latents.shape[0]
+            batches_timed += 1
+
+            # ── 2. .to(device) ───────────────────────────────────────────
+            _sync()
+            t0 = time.perf_counter()
             canny_cond            = canny_cond.to(device=cfg.device, dtype=cfg.dtype)
             depth_cond            = depth_cond.to(device=cfg.device, dtype=cfg.dtype)
             latents               = latents.to(device=cfg.device, dtype=cfg.dtype)
             encoder_hidden_states = text_embs.to(device=cfg.device, dtype=cfg.dtype)
+            _sync()
+            _T["to_device"] += time.perf_counter() - t0
 
             noise = torch.randn_like(latents)
             timesteps = torch.randint(
@@ -272,6 +300,9 @@ def train(cfg: TrainConfig) -> None:
             )
             noisy_latents = scheduler.add_noise(latents, noise, timesteps)
 
+            # ── 3. Fusion ControlNet calls ───────────────────────────────
+            _sync()
+            t0 = time.perf_counter()
             fused = fusion(
                 sample=noisy_latents,
                 timestep=timesteps,
@@ -279,7 +310,12 @@ def train(cfg: TrainConfig) -> None:
                 canny_cond=canny_cond,
                 depth_cond=depth_cond,
             )
+            _sync()
+            _T["fusion"] += time.perf_counter() - t0
 
+            # ── 4. U-Net forward ─────────────────────────────────────────
+            _sync()
+            t0 = time.perf_counter()
             noise_pred = parts["unet"](
                 sample=noisy_latents,
                 timestep=timesteps,
@@ -288,7 +324,12 @@ def train(cfg: TrainConfig) -> None:
                 mid_block_additional_residual=fused.mid_block_res_sample,
                 return_dict=True,
             ).sample
+            _sync()
+            _T["unet"] += time.perf_counter() - t0
 
+            # ── 5. Backward + optimizer step ─────────────────────────────
+            _sync()
+            t0 = time.perf_counter()
             # Divide loss so that the sum over accumulation steps ≈ a single
             # large-batch loss (same scale regardless of accum window size).
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
@@ -319,12 +360,31 @@ def train(cfg: TrainConfig) -> None:
 
                 if global_step % cfg.save_every_steps == 0:
                     fusion_mlp.save(output_dir / f"fusion_mlp_step_{global_step}.pth")
+            _sync()
+            _T["backward_optim"] += time.perf_counter() - t0
+
+            if cfg.max_batches is not None and batches_timed >= cfg.max_batches:
+                print(f"[profiling] reached max_batches={cfg.max_batches}, stopping early")
+                break
 
         print(f"\n--- epoch {epoch + 1} summary ---")
         print(f"avg loss: {epoch_loss_sum / max(epoch_optimizer_steps, 1):.6f}")
         print("weights after this epoch:")
         fusion_mlp.pretty_print()
         fusion_mlp.save(output_dir / f"fusion_mlp_epoch_{epoch + 1}.pth")
+
+    # ── Timing summary ───────────────────────────────────────────────────────
+    n = max(batches_timed, 1)
+    total = sum(_T.values())
+    print(f"\n{'─'*55}")
+    print(f"  Timing summary  ({batches_timed} batches × bs={cfg.batch_size})")
+    print(f"{'─'*55}")
+    for name, secs in _T.items():
+        avg_ms = secs / n * 1000
+        pct = secs / total * 100 if total > 0 else 0
+        print(f"  {name:<20s}  {avg_ms:7.2f} ms/batch  ({pct:5.1f}%)")
+    print(f"  {'total (sum)':<20s}  {total / n * 1000:7.2f} ms/batch")
+    print(f"{'─'*55}\n")
 
     fusion_mlp.save(output_dir / "fusion_mlp_last.pth")
 
