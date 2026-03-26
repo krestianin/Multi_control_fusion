@@ -3,8 +3,8 @@ import json
 from pathlib import Path
 
 # Change this to your DiffusionDB root folder
-ROOT = Path(r"E:/Users/Ivan/Downloads/diffusiondb_10k/diffusiondb/data")
-OUT_CSV = ROOT / "train.csv"
+ROOT = Path(r"data")
+OUT_CSV = "train.csv"
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 

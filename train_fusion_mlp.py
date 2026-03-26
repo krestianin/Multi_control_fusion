@@ -155,19 +155,19 @@ class LearnedPerLayerFusion(nn.Module):
 @dataclass
 class TrainConfig:
     output_dir: str = "fusion_mlp_ckpts"
-    batch_size: int = 8          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
-    gradient_accumulation_steps: int = 8   # effective batch = batch_size × accum_steps
+    batch_size: int = 16          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
+    gradient_accumulation_steps: int = 1   # effective batch = batch_size × accum_steps
     epochs: int = 1
     lr: float = 1e-3             # ok since only the tiny fusion MLP is trained
     weight_decay: float = 1e-4
     pt_dir: str = "pt"
     # num_inference_train_timesteps: int = 1000   # only 1 random t sampled per step — cost is fine
     max_grad_norm: float = 1.0
-    save_every_steps: int = 500   # counted in optimizer steps (post-accumulation)
+    # save_every_steps: int = 500   # counted in optimizer steps (post-accumulation)
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype: torch.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    max_batches: int | None = 500  # set to None to disable; 50 for a quick profiling run
+    dtype: torch.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    max_batches: int | None = None  # set to None to disable; 50 for a quick profiling run
 
 
 # -----------------------------
@@ -197,6 +197,62 @@ def discover_num_injection_points(parts, device: str, dtype: torch.dtype) -> int
     return len(out.down_block_res_samples) + 1
 
 
+def evaluate(fusion: LearnedPerLayerFusion, fusion_mlp: PerLayerFusionMLP,
+             loader: DataLoader, parts: dict, scheduler: DDIMScheduler,
+             cfg: TrainConfig) -> float:
+    """Run one pass over loader with no gradient updates and return average MSE loss."""
+    fusion_mlp.eval()
+    total_loss = 0.0
+    total_steps = 0
+    with torch.no_grad():
+        for canny_cond, depth_cond, latents, text_embs in loader:
+            canny_cond            = canny_cond.to(device=cfg.device, dtype=cfg.dtype)
+            depth_cond            = depth_cond.to(device=cfg.device, dtype=cfg.dtype)
+            latents               = latents.to(device=cfg.device, dtype=cfg.dtype)
+            encoder_hidden_states = text_embs.to(device=cfg.device, dtype=cfg.dtype)
+
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(
+                low=0,
+                high=scheduler.config.num_train_timesteps,
+                size=(latents.shape[0],),
+                device=cfg.device,
+                dtype=torch.long,
+            )
+            noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+
+            fused = fusion(
+                sample=noisy_latents,
+                timestep=timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                canny_cond=canny_cond,
+                depth_cond=depth_cond,
+            )
+            noise_pred = parts["unet"](
+                sample=noisy_latents,
+                timestep=timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                down_block_additional_residuals=fused.down_block_res_samples,
+                mid_block_additional_residual=fused.mid_block_res_sample,
+                return_dict=True,
+            ).sample
+
+        
+            total_loss += F.mse_loss(noise_pred.float(), noise.float(), reduction="mean").item()
+            total_steps += 1
+
+            print(
+                f"eval_step={total_steps}"
+            )
+
+
+            if cfg.max_batches is not None and total_steps >= cfg.max_batches:
+                break
+
+    fusion_mlp.train()
+    return total_loss / max(total_steps, 1)
+
+
 def train(cfg: TrainConfig) -> None:
     set_seed(cfg.seed)
 
@@ -223,21 +279,39 @@ def train(cfg: TrainConfig) -> None:
     print("Initial weights (before any training):")
     fusion_mlp.pretty_print()
 
+    scheduler = DDIMScheduler.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        subfolder="scheduler",
+    )
+
+    dataset = PrecomputedDataset(pt_dir=cfg.pt_dir)
+    n_eval = max(1, int(len(dataset) * 0.2))
+    n_train = len(dataset) - n_eval
+    train_dataset, eval_dataset = torch.utils.data.random_split(
+        dataset, [n_train, n_eval],
+        generator=torch.Generator().manual_seed(cfg.seed),
+    )
+    print(f"Dataset split: {n_train} train / {n_eval} eval samples\n")
+
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=collate_fn,
+    )
+
+    baseline_loss = evaluate(fusion, fusion_mlp, eval_loader, parts, scheduler, cfg)
+    print(f"Baseline loss (0.5/0.5 weights, eval set): {baseline_loss:.6f}\n")
+
     optimizer = torch.optim.AdamW(
         fusion_mlp.parameters(),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
 
-    scheduler = DDIMScheduler.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        subfolder="scheduler",
-    )
-    # scheduler.set_timesteps(cfg.num_inference_train_timesteps, device=cfg.device)
-
-    dataset = PrecomputedDataset(pt_dir=cfg.pt_dir)
     loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=2,
@@ -251,7 +325,7 @@ def train(cfg: TrainConfig) -> None:
 
     # ----- profiling timers (seconds, accumulated across batches) -----
     use_cuda = cfg.device == "cuda"
-    _T = {"dataloader": 0.0, "to_device": 0.0, "fusion": 0.0, "unet": 0.0, "backward_optim": 0.0}
+    _T = {"dataloader": 0.0, "to_device": 0.0, "fusion": 0.0, "unet": 0.0, "backward_optim": 0.0, "backward": 0.0, "optim": 0.0}
     batches_timed = 0
 
     def _sync():
@@ -328,19 +402,28 @@ def train(cfg: TrainConfig) -> None:
             _T["unet"] += time.perf_counter() - t0
 
             # ── 5. Backward + optimizer step ─────────────────────────────
-            _sync()
-            t0 = time.perf_counter()
+            # _sync()
+            # t0 = time.perf_counter()
             # Divide loss so that the sum over accumulation steps ≈ a single
             # large-batch loss (same scale regardless of accum window size).
+            _sync()
+            t1 = time.perf_counter()
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
             (loss / cfg.gradient_accumulation_steps).backward()
+            _sync()
+            _T["backward"] += time.perf_counter() - t1
+
             accum_loss += loss.item()
             accum_step += 1
 
             if accum_step % cfg.gradient_accumulation_steps == 0:
+                _sync()
+                t1 = time.perf_counter()
                 torch.nn.utils.clip_grad_norm_(fusion_mlp.parameters(), cfg.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                _sync()
+                _T["optim"] += time.perf_counter() - t1
 
                 global_step += 1
                 avg_loss = accum_loss / cfg.gradient_accumulation_steps
@@ -358,17 +441,18 @@ def train(cfg: TrainConfig) -> None:
                 #     best_loss = avg_loss
                 #     fusion_mlp.save(output_dir / "fusion_mlp_best.pth")
 
-                if global_step % cfg.save_every_steps == 0:
-                    fusion_mlp.save(output_dir / f"fusion_mlp_step_{global_step}.pth")
-            _sync()
-            _T["backward_optim"] += time.perf_counter() - t0
+                # if global_step % cfg.save_every_steps == 0:
+                #     fusion_mlp.save(output_dir / f"fusion_mlp_step_{global_step}.pth")
+            # _sync()
+            # _T["backward_optim"] += time.perf_counter() - t0
 
             if cfg.max_batches is not None and batches_timed >= cfg.max_batches:
                 print(f"[profiling] reached max_batches={cfg.max_batches}, stopping early")
                 break
 
+        epoch_eval_loss = evaluate(fusion, fusion_mlp, eval_loader, parts, scheduler, cfg)
         print(f"\n--- epoch {epoch + 1} summary ---")
-        print(f"avg loss: {epoch_loss_sum / max(epoch_optimizer_steps, 1):.6f}")
+        print(f"eval loss: {epoch_eval_loss:.6f}  (baseline was {baseline_loss:.6f})")
         print("weights after this epoch:")
         fusion_mlp.pretty_print()
         fusion_mlp.save(output_dir / f"fusion_mlp_epoch_{epoch + 1}.pth")

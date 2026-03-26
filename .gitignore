@@ -10,3 +10,7 @@ __pycache__/
 diffusiondb/
 data/
 pt/
+fusion_mlp_ckpts/
+models/
+
+*.png
