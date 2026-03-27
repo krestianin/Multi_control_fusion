@@ -13,7 +13,7 @@ from diffusers import DDIMScheduler
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from fusion_mlp import PerLayerFusionMLP
+from fusion_mlp import ContextEncoder, PerLayerFusionMLP
 from models import load_training_models
 
 
@@ -78,9 +78,18 @@ class LearnedPerLayerFusion(nn.Module):
     """
     Small helper that uses the frozen ControlNets and the trainable MLP.
 
-    We keep ControlNet outputs detached because the project proposal freezes
-    those backbones and only optimizes the MLP. The fused tensors still carry
-    gradients to the MLP because the learned alpha weights require gradients.
+    When a ContextEncoder is provided the MLP receives a per-sample context
+    vector built from:
+        - sinusoidal timestep embedding
+        - mean-pooled CLIP text embeddings
+        - globally-pooled first down-block features from the canny ControlNet
+        - globally-pooled first down-block features from the depth ControlNet
+
+    This makes the fusion weights image- and prompt-dependent rather than
+    static per-layer scalars, turning the model into a real conditional router.
+
+    ControlNet outputs are always detached (frozen backbones); the fused
+    tensors still carry gradients to the MLP / context encoder.
     """
 
     def __init__(
@@ -88,11 +97,13 @@ class LearnedPerLayerFusion(nn.Module):
         canny_controlnet: nn.Module,
         depth_controlnet: nn.Module,
         fusion_mlp: PerLayerFusionMLP,
+        context_encoder: ContextEncoder | None = None,
     ) -> None:
         super().__init__()
         self.canny_controlnet = canny_controlnet
         self.depth_controlnet = depth_controlnet
         self.fusion_mlp = fusion_mlp
+        self.context_encoder = context_encoder  # None → static (original) mode
 
     def forward(
         self,
@@ -121,27 +132,74 @@ class LearnedPerLayerFusion(nn.Module):
             )
 
         num_down = len(canny_out.down_block_res_samples)
-        weights = self.fusion_mlp.get_all_fusion_weights()  # [J, 2]
+
+        # ── Build context and get weights ────────────────────────────────────
+        context = None
+        if self.context_encoder is not None:
+            B = sample.shape[0]
+
+            # Globally pool the first (shallowest) ControlNet down-block feature
+            # shape: [B, C, H, W] → [B, C]
+            canny_feat = canny_out.down_block_res_samples[0].detach().float().mean(dim=(-2, -1))
+            depth_feat = depth_out.down_block_res_samples[0].detach().float().mean(dim=(-2, -1))
+
+            # Ensure timestep is [B]
+            t = timestep
+            if isinstance(t, (int, float)):
+                t = torch.tensor([t], device=sample.device, dtype=torch.long).expand(B)
+            elif not isinstance(t, torch.Tensor):
+                t = torch.tensor([t], device=sample.device, dtype=torch.long).expand(B)
+            elif t.dim() == 0:
+                t = t.unsqueeze(0).expand(B)
+            elif t.shape[0] == 1 and B > 1:
+                t = t.expand(B)
+
+            context = self.context_encoder(
+                timestep=t,
+                text_emb=encoder_hidden_states,
+                canny_feat=canny_feat,
+                depth_feat=depth_feat,
+            )  # [B, context_dim]
+
+        if context is not None:
+            weights = self.fusion_mlp(context=context)  # [B, J, 2]
+            num_weights = weights.shape[1]
+        else:
+            weights = self.fusion_mlp.get_all_fusion_weights()  # [J, 2]
+            num_weights = weights.shape[0]
+
         expected_points = num_down + 1
-        if weights.shape[0] != expected_points:
+        if num_weights != expected_points:
             raise ValueError(
-                f"Fusion MLP expects {weights.shape[0]} injection points, "
+                f"Fusion MLP expects {num_weights} injection points, "
                 f"but ControlNet produced {expected_points}"
             )
 
-        fused_down = []
-        for j, (c_res, d_res) in enumerate(zip(canny_out.down_block_res_samples, depth_out.down_block_res_samples)):
-            alpha_canny = weights[j, 0].to(dtype=c_res.dtype)
-            alpha_depth = weights[j, 1].to(dtype=d_res.dtype)
-            fused = alpha_canny * c_res.detach() + alpha_depth * d_res.detach()
-            fused_down.append(fused)
+        # ── Apply fusion weights ─────────────────────────────────────────────
+        batched = context is not None
+        B = sample.shape[0]
 
-        alpha_canny_mid = weights[num_down, 0].to(dtype=canny_out.mid_block_res_sample.dtype)
-        alpha_depth_mid = weights[num_down, 1].to(dtype=depth_out.mid_block_res_sample.dtype)
-        fused_mid = (
-            alpha_canny_mid * canny_out.mid_block_res_sample.detach()
-            + alpha_depth_mid * depth_out.mid_block_res_sample.detach()
-        )
+        fused_down = []
+        for j, (c_res, d_res) in enumerate(zip(
+            canny_out.down_block_res_samples, depth_out.down_block_res_samples
+        )):
+            if batched:
+                alpha_c = weights[:, j, 0].to(c_res.dtype).view(B, 1, 1, 1)
+                alpha_d = weights[:, j, 1].to(d_res.dtype).view(B, 1, 1, 1)
+            else:
+                alpha_c = weights[j, 0].to(c_res.dtype)
+                alpha_d = weights[j, 1].to(d_res.dtype)
+            fused_down.append(alpha_c * c_res.detach() + alpha_d * d_res.detach())
+
+        mid_c = canny_out.mid_block_res_sample
+        mid_d = depth_out.mid_block_res_sample
+        if batched:
+            alpha_c_mid = weights[:, num_down, 0].to(mid_c.dtype).view(B, 1, 1, 1)
+            alpha_d_mid = weights[:, num_down, 1].to(mid_d.dtype).view(B, 1, 1, 1)
+        else:
+            alpha_c_mid = weights[num_down, 0].to(mid_c.dtype)
+            alpha_d_mid = weights[num_down, 1].to(mid_d.dtype)
+        fused_mid = alpha_c_mid * mid_c.detach() + alpha_d_mid * mid_d.detach()
 
         return FusedControlOutput(
             down_block_res_samples=tuple(fused_down),
@@ -197,11 +255,62 @@ def discover_num_injection_points(parts, device: str, dtype: torch.dtype) -> int
     return len(out.down_block_res_samples) + 1
 
 
+# -----------------------------
+# Checkpoint helpers
+# -----------------------------
+
+def save_checkpoint(
+    path: str | Path,
+    fusion_mlp: PerLayerFusionMLP,
+    context_encoder: ContextEncoder | None,
+) -> None:
+    """Save fusion_mlp + optional context_encoder into a single file."""
+    payload: dict = {
+        "fusion_mlp_state_dict": fusion_mlp.state_dict(),
+        "fusion_mlp_config": {
+            "num_injection_points": fusion_mlp.num_injection_points,
+            "index_emb_dim":        fusion_mlp.index_emb_dim,
+            "hidden_dim":           fusion_mlp.hidden_dim,
+            "num_hidden_layers":    fusion_mlp.num_hidden_layers,
+            "dropout":              fusion_mlp.dropout,
+            "context_dim":          fusion_mlp.context_dim,
+        },
+    }
+    if context_encoder is not None:
+        payload["context_encoder_state_dict"] = context_encoder.state_dict()
+        payload["context_encoder_config"]     = context_encoder.config
+    torch.save(payload, Path(path))
+
+
+def load_checkpoint(
+    path: str | Path,
+    map_location: str | torch.device = "cpu",
+) -> tuple[PerLayerFusionMLP, ContextEncoder | None]:
+    """Load and return (fusion_mlp, context_encoder_or_None)."""
+    payload = torch.load(Path(path), map_location=map_location)
+    fusion_mlp = PerLayerFusionMLP(**payload["fusion_mlp_config"])
+    fusion_mlp.load_state_dict(payload["fusion_mlp_state_dict"])
+
+    context_encoder = None
+    if "context_encoder_config" in payload:
+        context_encoder = ContextEncoder(**payload["context_encoder_config"])
+        context_encoder.load_state_dict(payload["context_encoder_state_dict"])
+
+    return fusion_mlp, context_encoder
+
+
+# -----------------------------
+# Evaluation
+# -----------------------------
+
 def evaluate(fusion: LearnedPerLayerFusion, fusion_mlp: PerLayerFusionMLP,
+             context_encoder: ContextEncoder | None,
              loader: DataLoader, parts: dict, scheduler: DDIMScheduler,
              cfg: TrainConfig) -> float:
     """Run one pass over loader with no gradient updates and return average MSE loss."""
     fusion_mlp.eval()
+    if context_encoder is not None:
+        context_encoder.eval()
     total_loss = 0.0
     total_steps = 0
     with torch.no_grad():
@@ -250,6 +359,8 @@ def evaluate(fusion: LearnedPerLayerFusion, fusion_mlp: PerLayerFusionMLP,
                 break
 
     fusion_mlp.train()
+    if context_encoder is not None:
+        context_encoder.train()
     return total_loss / max(total_steps, 1)
 
 
@@ -260,7 +371,17 @@ def train(cfg: TrainConfig) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     parts = load_training_models(device=cfg.device, dtype=cfg.dtype)
+
     num_points = discover_num_injection_points(parts, cfg.device, cfg.dtype)
+
+    # ContextEncoder: 4×64 = 256-dim context from timestep, text, canny, depth
+    context_encoder = ContextEncoder(
+        text_dim=768,
+        canny_feat_dim=320,  # first down-block channels for SD v1.5 ControlNet
+        depth_feat_dim=320,
+        ts_emb_dim=256,
+        proj_dim=64,
+    ).to(device=cfg.device, dtype=cfg.dtype)
 
     fusion_mlp = PerLayerFusionMLP(
         num_injection_points=num_points,
@@ -268,12 +389,14 @@ def train(cfg: TrainConfig) -> None:
         hidden_dim=64,
         num_hidden_layers=2,
         dropout=0.0,
+        context_dim=context_encoder.context_dim,  # 256
     ).to(cfg.device)
 
     fusion = LearnedPerLayerFusion(
         canny_controlnet=parts["canny_controlnet"],
         depth_controlnet=parts["depth_controlnet"],
         fusion_mlp=fusion_mlp,
+        context_encoder=context_encoder,
     ).to(cfg.device)
 
     print("Initial weights (before any training):")
@@ -301,11 +424,12 @@ def train(cfg: TrainConfig) -> None:
         collate_fn=collate_fn,
     )
 
-    baseline_loss = evaluate(fusion, fusion_mlp, eval_loader, parts, scheduler, cfg)
+    baseline_loss = evaluate(fusion, fusion_mlp, context_encoder, eval_loader, parts, scheduler, cfg)
     print(f"Baseline loss (0.5/0.5 weights, eval set): {baseline_loss:.6f}\n")
 
+    trainable_params = list(fusion_mlp.parameters()) + list(context_encoder.parameters())
     optimizer = torch.optim.AdamW(
-        fusion_mlp.parameters(),
+        trainable_params,
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
@@ -336,6 +460,7 @@ def train(cfg: TrainConfig) -> None:
 
     for epoch in range(cfg.epochs):
         fusion_mlp.train()
+        context_encoder.train()
         epoch_loss_sum = 0.0
         epoch_optimizer_steps = 0
 
@@ -419,7 +544,7 @@ def train(cfg: TrainConfig) -> None:
             if accum_step % cfg.gradient_accumulation_steps == 0:
                 _sync()
                 t1 = time.perf_counter()
-                torch.nn.utils.clip_grad_norm_(fusion_mlp.parameters(), cfg.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 _sync()
@@ -450,12 +575,12 @@ def train(cfg: TrainConfig) -> None:
                 print(f"[profiling] reached max_batches={cfg.max_batches}, stopping early")
                 break
 
-        epoch_eval_loss = evaluate(fusion, fusion_mlp, eval_loader, parts, scheduler, cfg)
+        epoch_eval_loss = evaluate(fusion, fusion_mlp, context_encoder, eval_loader, parts, scheduler, cfg)
         print(f"\n--- epoch {epoch + 1} summary ---")
-        print(f"eval loss: {epoch_eval_loss:.6f}  (baseline was {baseline_loss:.6f})")
-        print("weights after this epoch:")
+        print(f"eval loss: {epoch_eval_loss:.6f}")
+        print("weights after this epoch (at zero context):")
         fusion_mlp.pretty_print()
-        fusion_mlp.save(output_dir / f"fusion_mlp_epoch_{epoch + 1}.pth")
+        save_checkpoint(output_dir / f"fusion_mlp_epoch_{epoch + 1}.pth", fusion_mlp, context_encoder)
 
     # ── Timing summary ───────────────────────────────────────────────────────
     n = max(batches_timed, 1)
@@ -470,7 +595,7 @@ def train(cfg: TrainConfig) -> None:
     print(f"  {'total (sum)':<20s}  {total / n * 1000:7.2f} ms/batch")
     print(f"{'─'*55}\n")
 
-    fusion_mlp.save(output_dir / "fusion_mlp_last.pth")
+    save_checkpoint(output_dir / "fusion_mlp_last.pth", fusion_mlp, context_encoder)
 
     print("Training finished.")
     print(f"Best loss: {best_loss:.6f}")

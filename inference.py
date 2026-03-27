@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from diffusers import DDPMScheduler
+from diffusers import DDIMScheduler
 from transformers import pipeline
 
 from models import load_models
@@ -103,11 +103,11 @@ def main():
     # User settings
     # -----------------------------
     image_path = "soldier.png"   # replace with your control/source image
-    prompt = "walking soldiers, one with a guitar"  
-    output_path = "last_model_soldier.png"
+    prompt = "walking toy soldiers"  
+    output_path = "20_last_model_soldier.png"
     fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_last.pth"  # set to None to fall back to fixed weights
 
-    num_inference_steps = 999
+    num_inference_steps = 90
     guidance_scale = 7.5
     height = 512
     width = 512
@@ -145,7 +145,7 @@ def main():
     # -----------------------------
     # Load scheduler
     # -----------------------------
-    scheduler = DDPMScheduler.from_pretrained(
+    scheduler = DDIMScheduler.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
         subfolder="scheduler",
     )
@@ -225,8 +225,10 @@ def main():
 
         if step_idx == 0 and fused.fusion_weights is not None:
             weights_cpu = fused.fusion_weights.detach().float().cpu()
-            print("Learned per-layer fusion weights:")
-            for j, pair in enumerate(weights_cpu):
+            # weights_cpu is [J, 2] (static) or [B, J, 2] (image-dependent)
+            w = weights_cpu[0] if weights_cpu.dim() == 3 else weights_cpu  # [J, 2]
+            print("Learned per-layer fusion weights (sample 0):")
+            for j, pair in enumerate(w):
                 print(f"  layer {j:02d}: canny={pair[0]:.4f}, depth={pair[1]:.4f}")
 
         print(f"Step {step_idx + 1}/{num_inference_steps} done")
