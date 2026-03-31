@@ -162,7 +162,10 @@ class PerLayerFusionMLP(nn.Module):
         self.mlp = nn.Sequential(*layers)
         self.out_proj = nn.Linear(in_dim, 2)
         nn.init.zeros_(self.out_proj.weight) # to make initial fusion = simple average of canny/depth (after softmax)
-        nn.init.zeros_(self.out_proj.bias)
+        nn.init.constant_(self.out_proj.bias, 0.0)  
+        # nn.init.zeros_(self.out_proj.weight) # to make initial fusion = simple average of canny/depth (after softmax)
+        # nn.init.zeros_(self.out_proj.bias)
+
 
     def forward(
         self,

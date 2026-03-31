@@ -32,7 +32,7 @@ class PrecomputedDataset(Dataset):
 
     def __init__(self, pt_dir: str | Path = "pt") -> None:
         pt_dir = Path(pt_dir)
-        self.samples: list[tuple[Path, Path, Path, Path]] = []
+        self.samples: list[tuple[str, Path, Path, Path, Path]] = []
 
         for latent_path in sorted(pt_dir.glob("*_latent.pt")):
             stem = latent_path.stem[: -len("_latent")]
@@ -42,7 +42,7 @@ class PrecomputedDataset(Dataset):
             missing  = [p for p in (canny, depth, text_emb) if not p.exists()]
             if missing:
                 raise FileNotFoundError(f"Missing for stem '{stem}': {missing}")
-            self.samples.append((canny, depth, latent_path, text_emb))
+            self.samples.append((stem, canny, depth, latent_path, text_emb))
 
         if not self.samples:
             raise ValueError(f"No *_latent.pt files found in {pt_dir}")
@@ -51,8 +51,9 @@ class PrecomputedDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        canny_path, depth_path, latent_path, emb_path = self.samples[idx]
+        stem, canny_path, depth_path, latent_path, emb_path = self.samples[idx]
         return (
+            stem,
             torch.load(canny_path, weights_only=True),    # [3, H, W]
             torch.load(depth_path, weights_only=True),    # [3, H, W]
             torch.load(latent_path, weights_only=True),   # [4, 64, 64]
@@ -61,8 +62,8 @@ class PrecomputedDataset(Dataset):
 
 
 def collate_fn(batch):
-    cannys, depths, latents, text_embs = zip(*batch)
-    return torch.stack(cannys), torch.stack(depths), torch.stack(latents), torch.stack(text_embs)
+    stems, cannys, depths, latents, text_embs = zip(*batch)
+    return list(stems), torch.stack(cannys), torch.stack(depths), torch.stack(latents), torch.stack(text_embs)
 
 
 # -----------------------------
@@ -72,6 +73,7 @@ def collate_fn(batch):
 class FusedControlOutput:
     down_block_res_samples: tuple[torch.Tensor, ...]
     mid_block_res_sample: torch.Tensor
+    fusion_weights: torch.Tensor | None = None
 
 
 class LearnedPerLayerFusion(nn.Module):
@@ -98,12 +100,14 @@ class LearnedPerLayerFusion(nn.Module):
         depth_controlnet: nn.Module,
         fusion_mlp: PerLayerFusionMLP,
         context_encoder: ContextEncoder | None = None,
+        temperature: float = 1.0,
     ) -> None:
         super().__init__()
         self.canny_controlnet = canny_controlnet
         self.depth_controlnet = depth_controlnet
         self.fusion_mlp = fusion_mlp
         self.context_encoder = context_encoder  # None → static (original) mode
+        self.temperature = float(temperature)
 
     def forward(
         self,
@@ -162,10 +166,10 @@ class LearnedPerLayerFusion(nn.Module):
             )  # [B, context_dim]
 
         if context is not None:
-            weights = self.fusion_mlp(context=context)  # [B, J, 2]
+            weights = self.fusion_mlp(context=context, temperature=self.temperature)  # [B, J, 2]
             num_weights = weights.shape[1]
         else:
-            weights = self.fusion_mlp.get_all_fusion_weights()  # [J, 2]
+            weights = self.fusion_mlp.get_all_fusion_weights(temperature=self.temperature)  # [J, 2]
             num_weights = weights.shape[0]
 
         expected_points = num_down + 1
@@ -204,6 +208,7 @@ class LearnedPerLayerFusion(nn.Module):
         return FusedControlOutput(
             down_block_res_samples=tuple(fused_down),
             mid_block_res_sample=fused_mid,
+            fusion_weights=weights,
         )
 
 
@@ -213,9 +218,9 @@ class LearnedPerLayerFusion(nn.Module):
 @dataclass
 class TrainConfig:
     output_dir: str = "fusion_mlp_ckpts"
-    batch_size: int = 16          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
+    batch_size: int = 1          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
     gradient_accumulation_steps: int = 1   # effective batch = batch_size × accum_steps
-    epochs: int = 1
+    epochs: int = 3
     lr: float = 1e-3             # ok since only the tiny fusion MLP is trained
     weight_decay: float = 1e-4
     pt_dir: str = "pt"
@@ -226,6 +231,11 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     max_batches: int | None = None  # set to None to disable; 50 for a quick profiling run
+    fusion_temperature: float = 1.0
+    deterministic_eval: bool = True
+    eval_seed: int = 1234
+    eval_timestep: int = 500
+    log_sample_weights: bool = True
 
 
 # -----------------------------
@@ -314,20 +324,35 @@ def evaluate(fusion: LearnedPerLayerFusion, fusion_mlp: PerLayerFusionMLP,
     total_loss = 0.0
     total_steps = 0
     with torch.no_grad():
-        for canny_cond, depth_cond, latents, text_embs in loader:
+        for stems, canny_cond, depth_cond, latents, text_embs in loader:
             canny_cond            = canny_cond.to(device=cfg.device, dtype=cfg.dtype)
             depth_cond            = depth_cond.to(device=cfg.device, dtype=cfg.dtype)
             latents               = latents.to(device=cfg.device, dtype=cfg.dtype)
             encoder_hidden_states = text_embs.to(device=cfg.device, dtype=cfg.dtype)
 
-            noise = torch.randn_like(latents)
-            timesteps = torch.randint(
-                low=0,
-                high=scheduler.config.num_train_timesteps,
-                size=(latents.shape[0],),
-                device=cfg.device,
-                dtype=torch.long,
-            )
+            if cfg.deterministic_eval:
+                generator = torch.Generator(device=cfg.device)
+                generator.manual_seed(cfg.eval_seed + total_steps)
+                noise = torch.randn(
+                    latents.shape,
+                    generator=generator,
+                    device=cfg.device,
+                    dtype=cfg.dtype,
+                )
+                timesteps = torch.full(
+                    (latents.shape[0],),
+                    fill_value=cfg.eval_timestep,
+                    device=cfg.device,
+                    dtype=torch.long,
+                )
+            else:
+                noise = torch.randn_like(latents)
+                timesteps = torch.full(
+                    (latents.shape[0],),
+                    fill_value=cfg.eval_timestep,
+                    device=cfg.device,
+                    dtype=torch.long,
+                )
             noisy_latents = scheduler.add_noise(latents, noise, timesteps)
 
             fused = fusion(
@@ -350,9 +375,14 @@ def evaluate(fusion: LearnedPerLayerFusion, fusion_mlp: PerLayerFusionMLP,
             total_loss += F.mse_loss(noise_pred.float(), noise.float(), reduction="mean").item()
             total_steps += 1
 
-            print(
-                f"eval_step={total_steps}"
-            )
+            print(f"eval_step={total_steps} stem={stems[0]} timestep={timesteps[0].item()}")
+
+            # if cfg.log_sample_weights and fused.fusion_weights is not None:
+            #     weights_to_print = fused.fusion_weights[0] if fused.fusion_weights.dim() == 3 else fused.fusion_weights
+                # print("sample-conditioned fusion weights:")
+                # for j, pair in enumerate(weights_to_print.detach().cpu()):
+                #     canny_w, depth_w = pair.tolist()
+                #     print(f"layer {j:02d}: canny={canny_w:.4f}, depth={depth_w:.4f}")
 
 
             if cfg.max_batches is not None and total_steps >= cfg.max_batches:
@@ -397,10 +427,11 @@ def train(cfg: TrainConfig) -> None:
         depth_controlnet=parts["depth_controlnet"],
         fusion_mlp=fusion_mlp,
         context_encoder=context_encoder,
+        temperature=cfg.fusion_temperature,
     ).to(cfg.device)
 
     print("Initial weights (before any training):")
-    fusion_mlp.pretty_print()
+    fusion_mlp.pretty_print(temperature=cfg.fusion_temperature)
 
     scheduler = DDIMScheduler.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
@@ -414,7 +445,8 @@ def train(cfg: TrainConfig) -> None:
         dataset, [n_train, n_eval],
         generator=torch.Generator().manual_seed(cfg.seed),
     )
-    print(f"Dataset split: {n_train} train / {n_eval} eval samples\n")
+    print(f"Dataset split: {n_train} train / {n_eval} eval samples")
+    print(f"Eval timestep is fixed at t={cfg.eval_timestep}\n")
 
     eval_loader = DataLoader(
         eval_dataset,
@@ -470,7 +502,7 @@ def train(cfg: TrainConfig) -> None:
             _sync()
             t0 = time.perf_counter()
             try:
-                canny_cond, depth_cond, latents, text_embs = next(loader_iter)
+                stems, canny_cond, depth_cond, latents, text_embs = next(loader_iter)
             except StopIteration:
                 break
             _sync()
@@ -559,7 +591,8 @@ def train(cfg: TrainConfig) -> None:
                 print(
                     f"epoch={epoch + 1}/{cfg.epochs} "
                     f"opt_step={global_step} "
-                    f"loss={avg_loss:.6f}"
+                    f"loss={avg_loss:.6f} "
+                    f"stem={stems[0]}"
                 )
 
                 # if avg_loss < best_loss:
@@ -577,9 +610,9 @@ def train(cfg: TrainConfig) -> None:
 
         epoch_eval_loss = evaluate(fusion, fusion_mlp, context_encoder, eval_loader, parts, scheduler, cfg)
         print(f"\n--- epoch {epoch + 1} summary ---")
-        print(f"eval loss: {epoch_eval_loss:.6f}")
+        print(f"eval loss: {epoch_eval_loss:.6f}" f"(baseline was {baseline_loss:.6f})")
         print("weights after this epoch (at zero context):")
-        fusion_mlp.pretty_print()
+        fusion_mlp.pretty_print(temperature=cfg.fusion_temperature)
         save_checkpoint(output_dir / f"fusion_mlp_epoch_{epoch + 1}.pth", fusion_mlp, context_encoder)
 
     # ── Timing summary ───────────────────────────────────────────────────────
@@ -601,8 +634,11 @@ def train(cfg: TrainConfig) -> None:
     print(f"Best loss: {best_loss:.6f}")
     print(f"Saved checkpoints to: {output_dir}")
     print("Final learned weights:")
-    fusion_mlp.pretty_print()
+    fusion_mlp.pretty_print(temperature=cfg.fusion_temperature)
 
 
 if __name__ == "__main__":
-    train(TrainConfig())
+    train(TrainConfig(
+        batch_size=1,
+        lr=1e-3,
+    ))
