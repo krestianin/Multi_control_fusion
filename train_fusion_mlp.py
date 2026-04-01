@@ -223,7 +223,10 @@ class TrainConfig:
     epochs: int = 3
     lr: float = 1e-3             # ok since only the tiny fusion MLP is trained
     weight_decay: float = 1e-4
-    pt_dir: str = "pt"
+    # for ai dataset
+    # pt_dir: str = "pt"
+    # for real dataset
+    pt_dir: str = "pt_flickr"
     # num_inference_train_timesteps: int = 1000   # only 1 random t sampled per step — cost is fine
     max_grad_norm: float = 1.0
     # save_every_steps: int = 500   # counted in optimizer steps (post-accumulation)

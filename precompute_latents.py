@@ -24,7 +24,10 @@ from transformers import CLIPTextModel, CLIPTokenizer
 
 CACHE_DIR  = str(Path(__file__).parent / "models")
 CSV_PATH   = "train.csv"
-PT_DIR     = Path("pt")
+#for ai dataset
+# PT_DIR     = Path("pt")
+#for real dataset
+PT_DIR     = Path("pt_flickr")
 IMAGE_SIZE = 512
 BASE_MODEL = "runwayml/stable-diffusion-v1-5"
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
