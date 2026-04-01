@@ -192,6 +192,7 @@ def main():
     # -----------------------------
     latent_h = height // 8
     latent_w = width // 8
+    torch.manual_seed(42)
     latents = torch.randn((1, 4, latent_h, latent_w), device=device, dtype=dtype)
     latents = latents * scheduler.init_noise_sigma
 
@@ -228,8 +229,8 @@ def main():
         if step_idx == 0 and fused.fusion_weights is not None:
             weights_cpu = fused.fusion_weights.detach().float().cpu()
             # weights_cpu is [J, 2] (static) or [B, J, 2] (image-dependent)
-            w = weights_cpu[0] if weights_cpu.dim() == 3 else weights_cpu  # [J, 2]
-            print("Learned per-layer fusion weights (sample 0):")
+            w = weights_cpu[1] if weights_cpu.dim() == 3 else weights_cpu  # [J, 2] — index 1 = conditional sample
+            print("Learned per-layer fusion weights (conditional sample):")
             for j, pair in enumerate(w):
                 print(f"  layer {j:02d}: canny={pair[0]:.4f}, depth={pair[1]:.4f}")
 
