@@ -45,7 +45,16 @@ class PrecomputedDataset(Dataset):
             self.samples.append((stem, canny, depth, latent_path, text_emb))
 
         if not self.samples:
-            raise ValueError(f"No *_latent.pt files found in {pt_dir}")
+            n_canny = sum(1 for _ in pt_dir.glob("*_canny.pt"))
+            n_depth = sum(1 for _ in pt_dir.glob("*_depth.pt"))
+            n_text  = sum(1 for _ in pt_dir.glob("*_text_emb.pt"))
+            raise ValueError(
+                f"No *_latent.pt files found in {pt_dir}. "
+                f"Found canny={n_canny}, depth={n_depth}, text_emb={n_text}. "
+                "Run preprocessing first: "
+                "`python prepare_dataset.py` (if train.csv is not ready), then "
+                "`python precompute_latents.py`."
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -109,6 +118,44 @@ class LearnedPerLayerFusion(nn.Module):
         self.context_encoder = context_encoder  # None → static (original) mode
         self.temperature = float(temperature)
 
+    @staticmethod
+    def _get_weight_maps(
+        weights: torch.Tensor,
+        layer_idx: int,
+        batch_size: int,
+        height: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert scalar or grid weights into spatial maps [B, 1, H, W].
+
+        Supported input layouts:
+          - [J, 2]
+          - [B, J, 2]
+          - [J, 2, Gh, Gw]
+          - [B, J, 2, Gh, Gw]
+        """
+        if weights.dim() == 5:  # [B, J, 2, Gh, Gw]
+            canny_w = weights[:, layer_idx, 0]  # [B, Gh, Gw]
+            depth_w = weights[:, layer_idx, 1]  # [B, Gh, Gw]
+        elif weights.dim() == 4:  # [J, 2, Gh, Gw]
+            canny_w = weights[layer_idx, 0].unsqueeze(0).expand(batch_size, -1, -1)  # [B, Gh, Gw]
+            depth_w = weights[layer_idx, 1].unsqueeze(0).expand(batch_size, -1, -1)  # [B, Gh, Gw]
+        elif weights.dim() == 3:  # [B, J, 2]
+            canny_w = weights[:, layer_idx, 0].view(batch_size, 1, 1).expand(batch_size, height, width)  # [B, H, W]
+            depth_w = weights[:, layer_idx, 1].view(batch_size, 1, 1).expand(batch_size, height, width)  # [B, H, W]
+        elif weights.dim() == 2:  # [J, 2]
+            canny_w = weights[layer_idx, 0].view(1, 1, 1).expand(batch_size, height, width)  # [B, H, W]
+            depth_w = weights[layer_idx, 1].view(1, 1, 1).expand(batch_size, height, width)  # [B, H, W]
+        else:
+            raise ValueError(f"Unsupported fusion weight shape: {tuple(weights.shape)}")
+
+        if canny_w.shape[-2:] != (height, width):
+            canny_w = F.interpolate(canny_w.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False).squeeze(1)
+            depth_w = F.interpolate(depth_w.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False).squeeze(1)
+
+        return canny_w.unsqueeze(1), depth_w.unsqueeze(1)  # [B, 1, H, W]
+
     def forward(
         self,
         sample: torch.Tensor,
@@ -166,11 +213,16 @@ class LearnedPerLayerFusion(nn.Module):
             )  # [B, context_dim]
 
         if context is not None:
-            weights = self.fusion_mlp(context=context, temperature=self.temperature)  # [B, J, 2]
-            num_weights = weights.shape[1]
+            weights = self.fusion_mlp(context=context, temperature=self.temperature)  # [B, J, 2, Gh, Gw]
         else:
-            weights = self.fusion_mlp.get_all_fusion_weights(temperature=self.temperature)  # [J, 2]
+            weights = self.fusion_mlp.get_all_fusion_weights(temperature=self.temperature)  # [J, 2, Gh, Gw]
+
+        if weights.dim() in (5, 3):
+            num_weights = weights.shape[1]
+        elif weights.dim() in (4, 2):
             num_weights = weights.shape[0]
+        else:
+            raise ValueError(f"Unsupported fusion weight shape: {tuple(weights.shape)}")
 
         expected_points = num_down + 1
         if num_weights != expected_points:
@@ -180,30 +232,19 @@ class LearnedPerLayerFusion(nn.Module):
             )
 
         # ── Apply fusion weights ─────────────────────────────────────────────
-        batched = context is not None
         B = sample.shape[0]
 
         fused_down = []
         for j, (c_res, d_res) in enumerate(zip(
             canny_out.down_block_res_samples, depth_out.down_block_res_samples
         )):
-            if batched:
-                alpha_c = weights[:, j, 0].to(c_res.dtype).view(B, 1, 1, 1)
-                alpha_d = weights[:, j, 1].to(d_res.dtype).view(B, 1, 1, 1)
-            else:
-                alpha_c = weights[j, 0].to(c_res.dtype)
-                alpha_d = weights[j, 1].to(d_res.dtype)
-            fused_down.append(alpha_c * c_res.detach() + alpha_d * d_res.detach())
+            alpha_c, alpha_d = self._get_weight_maps(weights, j, B, c_res.shape[-2], c_res.shape[-1])
+            fused_down.append(alpha_c.to(c_res.dtype) * c_res.detach() + alpha_d.to(d_res.dtype) * d_res.detach())
 
         mid_c = canny_out.mid_block_res_sample
         mid_d = depth_out.mid_block_res_sample
-        if batched:
-            alpha_c_mid = weights[:, num_down, 0].to(mid_c.dtype).view(B, 1, 1, 1)
-            alpha_d_mid = weights[:, num_down, 1].to(mid_d.dtype).view(B, 1, 1, 1)
-        else:
-            alpha_c_mid = weights[num_down, 0].to(mid_c.dtype)
-            alpha_d_mid = weights[num_down, 1].to(mid_d.dtype)
-        fused_mid = alpha_c_mid * mid_c.detach() + alpha_d_mid * mid_d.detach()
+        alpha_c_mid, alpha_d_mid = self._get_weight_maps(weights, num_down, B, mid_c.shape[-2], mid_c.shape[-1])
+        fused_mid = alpha_c_mid.to(mid_c.dtype) * mid_c.detach() + alpha_d_mid.to(mid_d.dtype) * mid_d.detach()
 
         return FusedControlOutput(
             down_block_res_samples=tuple(fused_down),
@@ -218,9 +259,9 @@ class LearnedPerLayerFusion(nn.Module):
 @dataclass
 class TrainConfig:
     output_dir: str = "fusion_mlp_ckpts"
-    batch_size: int = 1          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
+    batch_size: int = 8          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
     gradient_accumulation_steps: int = 1   # effective batch = batch_size × accum_steps
-    epochs: int = 3
+    epochs: int = 2
     lr: float = 1e-3             # ok since only the tiny fusion MLP is trained
     weight_decay: float = 1e-4
     # for ai dataset
@@ -235,6 +276,8 @@ class TrainConfig:
     dtype: torch.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     max_batches: int | None = None  # set to None to disable; 50 for a quick profiling run
     fusion_temperature: float = 1.0
+    fusion_weight_grid_h: int = 8
+    fusion_weight_grid_w: int = 8
     deterministic_eval: bool = True
     eval_seed: int = 1234
     eval_timestep: int = 500
@@ -287,6 +330,8 @@ def save_checkpoint(
             "num_hidden_layers":    fusion_mlp.num_hidden_layers,
             "dropout":              fusion_mlp.dropout,
             "context_dim":          fusion_mlp.context_dim,
+            "weight_grid_h":        fusion_mlp.weight_grid_h,
+            "weight_grid_w":        fusion_mlp.weight_grid_w,
         },
     }
     if context_encoder is not None:
@@ -301,7 +346,11 @@ def load_checkpoint(
 ) -> tuple[PerLayerFusionMLP, ContextEncoder | None]:
     """Load and return (fusion_mlp, context_encoder_or_None)."""
     payload = torch.load(Path(path), map_location=map_location)
-    fusion_mlp = PerLayerFusionMLP(**payload["fusion_mlp_config"])
+    fusion_cfg = dict(payload["fusion_mlp_config"])
+    # Old checkpoints saved before spatial grids existed.
+    fusion_cfg.setdefault("weight_grid_h", 1)
+    fusion_cfg.setdefault("weight_grid_w", 1)
+    fusion_mlp = PerLayerFusionMLP(**fusion_cfg)
     fusion_mlp.load_state_dict(payload["fusion_mlp_state_dict"])
 
     context_encoder = None
@@ -423,6 +472,8 @@ def train(cfg: TrainConfig) -> None:
         num_hidden_layers=2,
         dropout=0.0,
         context_dim=context_encoder.context_dim,  # 256
+        weight_grid_h=cfg.fusion_weight_grid_h,
+        weight_grid_w=cfg.fusion_weight_grid_w,
     ).to(cfg.device)
 
     fusion = LearnedPerLayerFusion(

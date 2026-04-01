@@ -102,13 +102,13 @@ def main():
     # -----------------------------
     # User settings
     # -----------------------------
-    image_path = "soldier.png"   # replace with your control/source image
-    prompt = "walking toy soldiers"  
-    output_path = "20_last_model_soldier.png"
-    fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_last.pth"  # set to None to fall back to fixed weights
+    image_path = "mirror.png"   # replace with your control/source image
+    prompt = "reflection of a man in the mirror"
+    output_path = "0.5_real_sigmoid_mirror.png"
+    fusion_mlp_path = None#"fusion_mlp_epoch_10_sigmoid_real.pth"  # set to None to fall back to fixed weights
 
-    num_inference_steps = 90
-    guidance_scale = 7.5
+    num_inference_steps = 30
+    guidance_scale = 9
     height = 512
     width = 512
 
@@ -225,11 +225,17 @@ def main():
 
         if step_idx == 0 and fused.fusion_weights is not None:
             weights_cpu = fused.fusion_weights.detach().float().cpu()
-            # weights_cpu is [J, 2] (static) or [B, J, 2] (image-dependent)
-            w = weights_cpu[0] if weights_cpu.dim() == 3 else weights_cpu  # [J, 2]
-            print("Learned per-layer fusion weights (sample 0):")
-            for j, pair in enumerate(w):
-                print(f"  layer {j:02d}: canny={pair[0]:.4f}, depth={pair[1]:.4f}")
+            # weights_cpu can be:
+            #   [J, 2]
+            #   [B, J, 2]
+            #   [J, 2, Gh, Gw]
+            #   [B, J, 2, Gh, Gw]
+            w = weights_cpu[0] if weights_cpu.dim() in (3, 5) else weights_cpu
+            print("Learned per-layer fusion weights (sample 0, spatial mean):")
+            for j in range(w.shape[0]):
+                canny_w = float(w[j, 0].mean().item())
+                depth_w = float(w[j, 1].mean().item())
+                print(f"  layer {j:02d}: canny={canny_w:.4f}, depth={depth_w:.4f}")
 
         print(f"Step {step_idx + 1}/{num_inference_steps} done")
 

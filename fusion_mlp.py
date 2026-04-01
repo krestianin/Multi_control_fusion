@@ -112,12 +112,12 @@ class PerLayerFusionMLP(nn.Module):
     Static mode (context_dim == 0, default)
     ----------------------------------------
     Input:  injection index embedding  [J, index_emb_dim]
-    Output: fusion weights             [J, 2]  (canny, depth)
+    Output: fusion weights             [J, 2, Gh, Gw]  (canny, depth)
 
     Image-dependent mode (context_dim > 0)
     ----------------------------------------
     Input:  index embedding + context  [B, J, index_emb_dim + context_dim]
-    Output: per-sample fusion weights  [B, J, 2]
+    Output: per-sample fusion weights  [B, J, 2, Gh, Gw]
 
     When context is not supplied at inference time but context_dim > 0, a
     zero context vector is used so that get_all_fusion_weights / pretty_print
@@ -133,6 +133,8 @@ class PerLayerFusionMLP(nn.Module):
         num_hidden_layers: int = 2,
         dropout: float = 0.0,
         context_dim: int = 0,
+        weight_grid_h: int = 8,
+        weight_grid_w: int = 8,
     ) -> None:
         super().__init__()
 
@@ -147,6 +149,10 @@ class PerLayerFusionMLP(nn.Module):
         self.num_hidden_layers = num_hidden_layers
         self.dropout = dropout
         self.context_dim = context_dim
+        self.weight_grid_h = weight_grid_h
+        self.weight_grid_w = weight_grid_w
+        if self.weight_grid_h <= 0 or self.weight_grid_w <= 0:
+            raise ValueError("weight_grid_h and weight_grid_w must be > 0")
 
         self.index_embedding = nn.Embedding(num_injection_points, index_emb_dim)
 
@@ -160,8 +166,8 @@ class PerLayerFusionMLP(nn.Module):
             in_dim = hidden_dim
 
         self.mlp = nn.Sequential(*layers)
-        self.out_proj = nn.Linear(in_dim, 2)
-        nn.init.zeros_(self.out_proj.weight) # to make initial fusion = simple average of canny/depth (after softmax)
+        self.out_proj = nn.Linear(in_dim, 2 * self.weight_grid_h * self.weight_grid_w)
+        nn.init.zeros_(self.out_proj.weight) # to make initial fusion = simple average of canny/depth (after sigmoid)
         nn.init.constant_(self.out_proj.bias, 0.0)  
         # nn.init.zeros_(self.out_proj.weight) # to make initial fusion = simple average of canny/depth (after softmax)
         # nn.init.zeros_(self.out_proj.bias)
@@ -180,14 +186,14 @@ class PerLayerFusionMLP(nn.Module):
                 Optional [J] long tensor. Defaults to all indices.
             context:
                 Optional [B, context_dim] tensor. When supplied the MLP is run
-                once per sample and returns [B, J, 2] weights.
+                once per sample and returns [B, J, 2, Gh, Gw] weights.
                 When omitted and context_dim > 0, a zero vector is used and
-                the output is squeezed back to [J, 2] for compatibility.
+                the output is squeezed back to [J, 2, Gh, Gw] for compatibility.
             temperature: sigmoid temperature (> 0).
             return_logits: if True returns (weights, logits).
 
         Returns:
-            weights [J, 2] or [B, J, 2].
+            weights [J, 2, Gh, Gw] or [B, J, 2, Gh, Gw].
         """
         if temperature <= 0.0:
             raise ValueError("temperature must be > 0")
@@ -223,6 +229,7 @@ class PerLayerFusionMLP(nn.Module):
         # nn.Linear applies to last dim, works for both [J, d] and [B, J, d]
         x = self.mlp(x)
         logits = self.out_proj(x)
+        logits = logits.view(*logits.shape[:-1], 2, self.weight_grid_h, self.weight_grid_w)
         weights = torch.sigmoid(logits / temperature)
 
         if squeeze:
@@ -234,14 +241,15 @@ class PerLayerFusionMLP(nn.Module):
         return weights
 
     def get_all_fusion_weights(self, temperature: float = 1.5) -> torch.Tensor:
-        """Returns [num_injection_points, 2] (at zero context when context_dim > 0)."""
+        """Returns [num_injection_points, 2, Gh, Gw] (at zero context when context_dim > 0)."""
         return self.forward(injection_indices=None, context=None, temperature=temperature)
 
     @torch.no_grad()
     def pretty_print(self, temperature: float = 1.0) -> None:
         weights = self.get_all_fusion_weights(temperature=temperature).detach().cpu()
-        for j, pair in enumerate(weights):
-            canny_w, depth_w = pair.tolist()
+        for j in range(weights.shape[0]):
+            canny_w = float(weights[j, 0].mean().item())
+            depth_w = float(weights[j, 1].mean().item())
             print(f"layer {j:02d}: canny={canny_w:.4f}, depth={depth_w:.4f}")
 
     def save(self, path: str | Path) -> None:
@@ -255,6 +263,8 @@ class PerLayerFusionMLP(nn.Module):
                 "num_hidden_layers":    self.num_hidden_layers,
                 "dropout":              self.dropout,
                 "context_dim":          self.context_dim,
+                "weight_grid_h":        self.weight_grid_h,
+                "weight_grid_w":        self.weight_grid_w,
             },
         }
         torch.save(payload, path)
@@ -262,7 +272,11 @@ class PerLayerFusionMLP(nn.Module):
     @classmethod
     def load(cls, path: str | Path, map_location: str | torch.device = "cpu") -> "PerLayerFusionMLP":
         payload = torch.load(path, map_location=map_location)
-        model = cls(**payload["config"])
+        cfg = dict(payload["config"])
+        # Old checkpoints saved before spatial grids existed.
+        cfg.setdefault("weight_grid_h", 1)
+        cfg.setdefault("weight_grid_w", 1)
+        model = cls(**cfg)
         model.load_state_dict(payload["state_dict"])
         return model
 
@@ -282,9 +296,17 @@ def load_checkpoint(
     """
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
 
+    def _with_legacy_grid_defaults(cfg: dict) -> dict:
+        # Old checkpoints saved before spatial weight maps existed.
+        # Preserve old behavior by loading them as 1x1 (global) weights.
+        cfg = dict(cfg)
+        cfg.setdefault("weight_grid_h", 1)
+        cfg.setdefault("weight_grid_w", 1)
+        return cfg
+
     # New combined format written by save_checkpoint()
     if "fusion_mlp_config" in payload:
-        fusion_mlp = PerLayerFusionMLP(**payload["fusion_mlp_config"])
+        fusion_mlp = PerLayerFusionMLP(**_with_legacy_grid_defaults(payload["fusion_mlp_config"]))
         fusion_mlp.load_state_dict(payload["fusion_mlp_state_dict"])
         context_encoder = None
         if "context_encoder_config" in payload:
@@ -293,6 +315,6 @@ def load_checkpoint(
         return fusion_mlp, context_encoder
 
     # Old format written by PerLayerFusionMLP.save()
-    fusion_mlp = PerLayerFusionMLP(**payload["config"])
+    fusion_mlp = PerLayerFusionMLP(**_with_legacy_grid_defaults(payload["config"]))
     fusion_mlp.load_state_dict(payload["state_dict"])
     return fusion_mlp, None

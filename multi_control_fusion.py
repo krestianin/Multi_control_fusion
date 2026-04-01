@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from fusion_mlp import ContextEncoder, PerLayerFusionMLP, load_checkpoint
 
@@ -21,7 +22,7 @@ class FusedControlOutput:
     """
     down_block_res_samples: Tuple[torch.Tensor, ...]
     mid_block_res_sample: torch.Tensor
-    fusion_weights: Optional[torch.Tensor] = None  # [J, 2] or [B, J, 2]
+    fusion_weights: Optional[torch.Tensor] = None  # [J, 2, Gh, Gw] or [B, J, 2, Gh, Gw]
 
 
 class LearnedWeightMultiControlFusion(nn.Module):
@@ -78,6 +79,44 @@ class LearnedWeightMultiControlFusion(nn.Module):
 
     def has_learned_fusion(self) -> bool:
         return self.fusion_mlp is not None
+
+    @staticmethod
+    def _get_weight_maps(
+        weights: torch.Tensor,
+        layer_idx: int,
+        batch_size: int,
+        height: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert scalar or grid weights into spatial maps [B, 1, H, W].
+
+        Supported input layouts:
+          - [J, 2]
+          - [B, J, 2]
+          - [J, 2, Gh, Gw]
+          - [B, J, 2, Gh, Gw]
+        """
+        if weights.dim() == 5:  # [B, J, 2, Gh, Gw]
+            canny_w = weights[:, layer_idx, 0]  # [B, Gh, Gw]
+            depth_w = weights[:, layer_idx, 1]  # [B, Gh, Gw]
+        elif weights.dim() == 4:  # [J, 2, Gh, Gw]
+            canny_w = weights[layer_idx, 0].unsqueeze(0).expand(batch_size, -1, -1)  # [B, Gh, Gw]
+            depth_w = weights[layer_idx, 1].unsqueeze(0).expand(batch_size, -1, -1)  # [B, Gh, Gw]
+        elif weights.dim() == 3:  # [B, J, 2]
+            canny_w = weights[:, layer_idx, 0].view(batch_size, 1, 1).expand(batch_size, height, width)  # [B, H, W]
+            depth_w = weights[:, layer_idx, 1].view(batch_size, 1, 1).expand(batch_size, height, width)  # [B, H, W]
+        elif weights.dim() == 2:  # [J, 2]
+            canny_w = weights[layer_idx, 0].view(1, 1, 1).expand(batch_size, height, width)  # [B, H, W]
+            depth_w = weights[layer_idx, 1].view(1, 1, 1).expand(batch_size, height, width)  # [B, H, W]
+        else:
+            raise ValueError(f"Unsupported fusion weight shape: {tuple(weights.shape)}")
+
+        if canny_w.shape[-2:] != (height, width):
+            canny_w = F.interpolate(canny_w.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False).squeeze(1)
+            depth_w = F.interpolate(depth_w.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False).squeeze(1)
+
+        return canny_w.unsqueeze(1), depth_w.unsqueeze(1)  # [B, 1, H, W]
 
     def _run_controlnets(
         self,
@@ -181,41 +220,44 @@ class LearnedWeightMultiControlFusion(nn.Module):
                 canny_feat=canny_feat,
                 depth_feat=depth_feat,
             )  # [B, context_dim]
-            weights = self.fusion_mlp(context=context)  # [B, J, 2]
+            weights = self.fusion_mlp(context=context, temperature=self.temperature)  # [B, J, 2, Gh, Gw]
         else:
-            # Static learned weights (old checkpoint without context encoder): [J, 2]
+            # Static learned weights (old checkpoint without context encoder): [J, 2, Gh, Gw]
             weights = self.fusion_mlp.get_all_fusion_weights(temperature=self.temperature)
             weights = weights.to(device=sample.device, dtype=canny_out.mid_block_res_sample.dtype)
 
-        batched = weights.dim() == 3  # True when context encoder was used
+        if weights.dim() in (5, 3):
+            num_weights = weights.shape[1]
+        elif weights.dim() in (4, 2):
+            num_weights = weights.shape[0]
+        else:
+            raise ValueError(f"Unsupported fusion weight shape: {tuple(weights.shape)}")
+        expected_points = num_down + 1
+        if num_weights != expected_points:
+            raise ValueError(
+                f"Fusion weights provide {num_weights} injection points, "
+                f"but ControlNet produced {expected_points}"
+            )
+
+        # weights can be global scalars or low-res spatial maps.
 
         # ── Apply weights ────────────────────────────────────────────────────
         fused_down = []
         for j, (c_res, d_res) in enumerate(
             zip(canny_out.down_block_res_samples, depth_out.down_block_res_samples)
         ):
-            if batched:
-                canny_w = weights[:, j, 0].to(c_res.dtype).view(B, 1, 1, 1)
-                depth_w = weights[:, j, 1].to(d_res.dtype).view(B, 1, 1, 1)
-            else:
-                canny_w = weights[j, 0].to(c_res.dtype)
-                depth_w = weights[j, 1].to(d_res.dtype)
-            fused_down.append(canny_w * c_res + depth_w * d_res)
+            canny_w, depth_w = self._get_weight_maps(weights, j, B, c_res.shape[-2], c_res.shape[-1])
+            fused_down.append(canny_w.to(c_res.dtype) * c_res + depth_w.to(d_res.dtype) * d_res)
 
         mid_c = canny_out.mid_block_res_sample
         mid_d = depth_out.mid_block_res_sample
-        if batched:
-            canny_mid = weights[:, num_down, 0].to(mid_c.dtype).view(B, 1, 1, 1)
-            depth_mid = weights[:, num_down, 1].to(mid_d.dtype).view(B, 1, 1, 1)
-        else:
-            canny_mid = weights[num_down, 0].to(mid_c.dtype)
-            depth_mid = weights[num_down, 1].to(mid_d.dtype)
-        fused_mid = canny_mid * mid_c + depth_mid * mid_d
+        canny_mid, depth_mid = self._get_weight_maps(weights, num_down, B, mid_c.shape[-2], mid_c.shape[-1])
+        fused_mid = canny_mid.to(mid_c.dtype) * mid_c + depth_mid.to(mid_d.dtype) * mid_d
 
         return FusedControlOutput(
             down_block_res_samples=tuple(fused_down),
             mid_block_res_sample=fused_mid,
-            fusion_weights=weights,  # [J, 2] or [B, J, 2]
+            fusion_weights=weights,  # [J, 2, Gh, Gw] or [B, J, 2, Gh, Gw]
         )
 
 
