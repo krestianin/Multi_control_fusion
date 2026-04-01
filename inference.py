@@ -102,13 +102,14 @@ def main():
     # -----------------------------
     # User settings
     # -----------------------------
-    image_path = "soldier.png"   # replace with your control/source image
-    prompt = "walking toy soldiers"  
-    output_path = "20_last_model_soldier.png"
-    fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_last.pth"  # set to None to fall back to fixed weights
+    canny_image_path = "pattern.png"   # image used to extract Canny control
+    depth_image_path = "ball.png"   # image used to extract Depth control
+    prompt = "footballs"  
+    output_path = "combined_road.png"
+    fusion_mlp_path = "fusion_mlp_epoch_400.pth"  # set to None to fall back to fixed weights
 
-    num_inference_steps = 90
-    guidance_scale = 7.5
+    num_inference_steps = 30
+    guidance_scale = 9
     height = 512
     width = 512
 
@@ -132,8 +133,8 @@ def main():
         fusion_mlp_path=fusion_mlp_path,
         map_location=device,
         temperature=1.0,
-        fallback_canny_weight=0.5,
-        fallback_depth_weight=0.5,
+        fallback_canny_weight=1.0,
+        fallback_depth_weight=1.0,
         validate_shapes_once=True,
     ).to(device)
 
@@ -154,18 +155,19 @@ def main():
     # -----------------------------
     # Load image and build controls
     # -----------------------------
-    image = load_rgb_image(image_path, size=512)
+    canny_source_image = load_rgb_image(canny_image_path, size=512)
+    depth_source_image = load_rgb_image(depth_image_path, size=512)
 
-    print("Computing Canny control...")
-    canny_image = make_canny_control(image)
+    print(f"Computing Canny control from: {canny_image_path}")
+    canny_image = make_canny_control(canny_source_image)
 
-    print("Computing Depth control...")
+    print(f"Computing Depth control from: {depth_image_path}")
     depth_pipe = pipeline(
         task="depth-estimation",
         model="Intel/dpt-large",
         device=0 if device == "cuda" else -1,
     )
-    depth_image = make_depth_control(image, depth_pipe)
+    depth_image = make_depth_control(depth_source_image, depth_pipe)
 
     canny_cond = pil_to_tensor_01(canny_image, device=device, dtype=dtype)
     depth_cond = pil_to_tensor_01(depth_image, device=device, dtype=dtype)
