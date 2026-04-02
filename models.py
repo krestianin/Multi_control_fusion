@@ -21,9 +21,9 @@ def load_models(device: str = "cuda", dtype: torch.dtype = torch.float16, cache_
         Path(cache_dir).mkdir(exist_ok=True)
         print(f"[DEBUG] Using local cache directory: {cache_dir}")
     
-    base_model = "runwayml/stable-diffusion-v1-5"
-    canny_model = "lllyasviel/sd-controlnet-canny"
-    depth_model = "lllyasviel/sd-controlnet-depth"
+    base_model = "sd-legacy/stable-diffusion-v1-5"
+    canny_model = "lllyasviel/control_v11p_sd15_canny"
+    depth_model = "lllyasviel/control_v11f1p_sd15_depth"
 
     print(f"[DEBUG] Loading Canny ControlNet from {canny_model}...")
     canny_controlnet = ControlNetModel.from_pretrained(
@@ -56,10 +56,10 @@ def load_models(device: str = "cuda", dtype: torch.dtype = torch.float16, cache_
     unet = unet.to(device)
     print("[DEBUG] UNet loaded and on device")
 
-    print(f"[DEBUG] Loading VAE from {base_model}...")
+    vae_model = "stabilityai/sd-vae-ft-mse"
+    print(f"[DEBUG] Loading VAE from {vae_model}...")
     vae = AutoencoderKL.from_pretrained(
-        base_model,
-        subfolder="vae",
+        vae_model,
         torch_dtype=dtype,
         cache_dir=cache_dir,
     )
@@ -115,9 +115,9 @@ def load_training_models(device: str = "cuda", dtype: torch.dtype = torch.float1
         cache_dir = str(Path(__file__).parent / "models")
         Path(cache_dir).mkdir(exist_ok=True)
 
-    base_model = "runwayml/stable-diffusion-v1-5"
-    canny_model = "lllyasviel/sd-controlnet-canny"
-    depth_model = "lllyasviel/sd-controlnet-depth"
+    base_model = "sd-legacy/stable-diffusion-v1-5"
+    canny_model = "lllyasviel/control_v11p_sd15_canny"
+    depth_model = "lllyasviel/control_v11f1p_sd15_depth"
 
     print("[DEBUG] Loading Canny ControlNet…")
     canny_controlnet = ControlNetModel.from_pretrained(

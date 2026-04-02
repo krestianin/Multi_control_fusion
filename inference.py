@@ -102,10 +102,10 @@ def main():
     # -----------------------------
     # User settings
     # -----------------------------
-    canny_image_path = "pattern.png"   # image used to extract Canny control
-    depth_image_path = "ball.png"   # image used to extract Depth control
-    prompt = "footballs"  
-    output_path = "combined_road.png"
+    canny_image_path = "robot.png"   # image used to extract Canny control
+    depth_image_path = "white_shirt.png"   # image used to extract Depth control
+    prompt = "photorealistic robot sea"  # text prompt
+    output_path = "robot_new.png"
     fusion_mlp_path = "fusion_mlp_epoch_400.pth"  # set to None to fall back to fixed weights
 
     num_inference_steps = 30
@@ -133,8 +133,8 @@ def main():
         fusion_mlp_path=fusion_mlp_path,
         map_location=device,
         temperature=1.0,
-        fallback_canny_weight=1.0,
-        fallback_depth_weight=1.0,
+        fallback_canny_weight=0,
+        fallback_depth_weight=1,
         validate_shapes_once=True,
     ).to(device)
 
@@ -147,7 +147,7 @@ def main():
     # Load scheduler
     # -----------------------------
     scheduler = DDIMScheduler.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
+        "sd-legacy/stable-diffusion-v1-5",
         subfolder="scheduler",
     )
     scheduler.set_timesteps(num_inference_steps, device=device)
@@ -161,10 +161,13 @@ def main():
     print(f"Computing Canny control from: {canny_image_path}")
     canny_image = make_canny_control(canny_source_image)
 
+    depth_model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+
     print(f"Computing Depth control from: {depth_image_path}")
+    print(f"Using depth model: {depth_model_id}")
     depth_pipe = pipeline(
         task="depth-estimation",
-        model="Intel/dpt-large",
+        model=depth_model_id,
         device=0 if device == "cuda" else -1,
     )
     depth_image = make_depth_control(depth_source_image, depth_pipe)

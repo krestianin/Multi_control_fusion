@@ -437,7 +437,7 @@ def train(cfg: TrainConfig) -> None:
     fusion_mlp.pretty_print(temperature=cfg.fusion_temperature)
 
     scheduler = DDIMScheduler.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
+        "sd-legacy/stable-diffusion-v1-5",
         subfolder="scheduler",
     )
 

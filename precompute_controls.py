@@ -1,13 +1,13 @@
 """
-Run ONCE before training to pre-compute canny edges and DPT depth maps.
+Run ONCE before training to pre-compute canny edges and Depth Anything V2 depth maps.
 
     python precompute_controls.py
 
 Saves into a pt/ directory (created automatically):
     pt/{stem}_canny.pt   — Canny edge map  [3, 512, 512] float32 in [0, 1]
-    pt/{stem}_depth.pt   — DPT depth map   [3, 512, 512] float32 in [0, 1]
+    pt/{stem}_depth.pt   — Depth Anything V2 map [3, 512, 512] float32 in [0, 1]
 
-After this script finishes you can delete Intel/dpt-large from your cache
+After this script finishes you can delete depth-anything/Depth-Anything-V2-Small-hf from your cache
 if you want to recover disk space — it is never needed during training.
 """
 from __future__ import annotations
@@ -49,11 +49,12 @@ def main() -> None:
         image_paths = [Path(row["image_path"]) for row in csv.DictReader(f)]
 
     print(f"Pre-computing controls for {len(image_paths)} images…")
-    print(f"Loading Intel/dpt-large (cached in {CACHE_DIR})…")
+    depth_model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+    print(f"Loading {depth_model_id} (cached in {CACHE_DIR})…")
 
     depth_pipe = pipeline(
         task="depth-estimation",
-        model="Intel/dpt-large",
+        model=depth_model_id,
         device=0,           # GPU only for speed; change to -1 for CPU
         model_kwargs={"cache_dir": CACHE_DIR},
     )

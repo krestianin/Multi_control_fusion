@@ -14,5 +14,7 @@ pt_flickr/
 fusion_mlp_ckpts/
 models/
 flickr*/
+results/
 
+*.pth
 *.png
