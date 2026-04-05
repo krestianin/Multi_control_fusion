@@ -24,10 +24,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 
 CACHE_DIR  = str(Path(__file__).parent / "models")
 CSV_PATH   = "train.csv"
-#for ai dataset
-# PT_DIR     = Path("pt")
-#for real dataset
-PT_DIR     = Path("pt_flickr")
+PT_DIR     = Path("pt_combined")
 IMAGE_SIZE = 512
 BASE_MODEL = "sd-legacy/stable-diffusion-v1-5"
 VAE_MODEL  = "stabilityai/sd-vae-ft-mse"
