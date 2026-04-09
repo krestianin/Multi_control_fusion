@@ -1,14 +1,40 @@
 from __future__ import annotations
 
+import io
+import os
+import shutil
+import sys
 import cv2
 import numpy as np
 import torch
+from datetime import datetime
+from pathlib import Path
 from PIL import Image
 from diffusers import DDIMScheduler
 from transformers import pipeline
 
 from models import load_models
 from multi_control_fusion import LearnedWeightMultiControlFusion
+
+
+class _Tee:
+    """Write to both the original stream and a buffer."""
+    def __init__(self, stream):
+        self._stream = stream
+        self._buf = io.StringIO()
+
+    def write(self, data):
+        self._stream.write(data)
+        self._buf.write(data)
+
+    def flush(self):
+        self._stream.flush()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+    def getvalue(self):
+        return self._buf.getvalue()
 
 
 def load_rgb_image(image_path: str, size: int = 512) -> Image.Image:
@@ -102,13 +128,30 @@ def main():
     # -----------------------------
     # User settings
     # -----------------------------
-    image_path = "soldier.png"   # replace with your control/source image
-    prompt = "walking toy soldiers"  
-    output_path = "20_last_model_soldier.png"
-    fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_last.pth"  # set to None to fall back to fixed weights
+    canny_image_path = "rug.png"   # image used to extract Canny control
+    depth_image_path = "rug.png"   # image used to extract Depth control
+    prompt = "room"  # text prompt
+    fusion_mlp_path = N#"fusion_mlp_epoch_400_sigmoid_updated.pth"  # set to None to fall back to fixed weights
 
-    num_inference_steps = 90
-    guidance_scale = 7.5
+    # -----------------------------
+    # Build output folder
+    # -----------------------------
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    canny_stem = Path(canny_image_path).stem
+    depth_stem = Path(depth_image_path).stem
+    run_name = f"{canny_stem}_{depth_stem}_{timestamp}"
+    out_dir = Path(run_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    result_filename = f"result_{canny_stem}_{depth_stem}_{timestamp}.png"
+    output_path = str(out_dir / result_filename)
+
+    # Capture all terminal output so we can save it later
+    _tee = _Tee(sys.stdout)
+    sys.stdout = _tee
+
+    num_inference_steps = 30
+    guidance_scale = 9
     height = 512
     width = 512
 
@@ -132,8 +175,8 @@ def main():
         fusion_mlp_path=fusion_mlp_path,
         map_location=device,
         temperature=1.0,
-        fallback_canny_weight=0.5,
-        fallback_depth_weight=0.5,
+        fallback_canny_weight=1,
+        fallback_depth_weight=0,
         validate_shapes_once=True,
     ).to(device)
 
@@ -146,7 +189,7 @@ def main():
     # Load scheduler
     # -----------------------------
     scheduler = DDIMScheduler.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
+        "sd-legacy/stable-diffusion-v1-5",
         subfolder="scheduler",
     )
     scheduler.set_timesteps(num_inference_steps, device=device)
@@ -154,18 +197,22 @@ def main():
     # -----------------------------
     # Load image and build controls
     # -----------------------------
-    image = load_rgb_image(image_path, size=512)
+    canny_source_image = load_rgb_image(canny_image_path, size=512)
+    depth_source_image = load_rgb_image(depth_image_path, size=512)
 
-    print("Computing Canny control...")
-    canny_image = make_canny_control(image)
+    print(f"Computing Canny control from: {canny_image_path}")
+    canny_image = make_canny_control(canny_source_image)
 
-    print("Computing Depth control...")
+    depth_model_id = "depth-anything/Depth-Anything-V2-Small-hf"
+
+    print(f"Computing Depth control from: {depth_image_path}")
+    print(f"Using depth model: {depth_model_id}")
     depth_pipe = pipeline(
         task="depth-estimation",
-        model="Intel/dpt-large",
+        model=depth_model_id,
         device=0 if device == "cuda" else -1,
     )
-    depth_image = make_depth_control(image, depth_pipe)
+    depth_image = make_depth_control(depth_source_image, depth_pipe)
 
     canny_cond = pil_to_tensor_01(canny_image, device=device, dtype=dtype)
     depth_cond = pil_to_tensor_01(depth_image, device=device, dtype=dtype)
@@ -241,11 +288,23 @@ def main():
     result = decode_latents(latents, parts["vae"])
     result.save(output_path)
 
-    canny_image.save("debug_canny.png")
-    depth_image.save("debug_depth.png")
+    # Save control images
+    canny_image.save(str(out_dir / "canny.png"))
+    depth_image.save(str(out_dir / "depth.png"))
+
+    # Copy original source images
+    shutil.copy(canny_image_path, str(out_dir / f"source_canny_{Path(canny_image_path).name}"))
+    shutil.copy(depth_image_path, str(out_dir / f"source_depth_{Path(depth_image_path).name}"))
 
     print(f"Saved generated image to: {output_path}")
+    print(f"Output folder: {out_dir.resolve()}")
     print("Done.")
+
+    # Restore stdout and save terminal log
+    sys.stdout = _tee._stream
+    log_path = out_dir / "log.txt"
+    log_path.write_text(_tee.getvalue())
+    print(f"Terminal log saved to: {log_path}")
 
 
 if __name__ == "__main__":

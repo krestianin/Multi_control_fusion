@@ -119,7 +119,7 @@ def main() -> None:
     parts = load_training_models(device=cfg.device, dtype=cfg.dtype)
 
     scheduler = DDIMScheduler.from_pretrained(
-        "runwayml/stable-diffusion-v1-5", subfolder="scheduler"
+        "sd-legacy/stable-diffusion-v1-5", subfolder="scheduler"
     )
 
     dataset = PrecomputedDataset(pt_dir=cfg.pt_dir)

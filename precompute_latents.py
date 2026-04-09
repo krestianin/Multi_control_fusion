@@ -24,12 +24,10 @@ from transformers import CLIPTextModel, CLIPTokenizer
 
 CACHE_DIR  = str(Path(__file__).parent / "models")
 CSV_PATH   = "train.csv"
-#for ai dataset
-# PT_DIR     = Path("pt")
-#for real dataset
-PT_DIR     = Path("pt_flickr")
+PT_DIR     = Path("pt_combined")
 IMAGE_SIZE = 512
-BASE_MODEL = "runwayml/stable-diffusion-v1-5"
+BASE_MODEL = "sd-legacy/stable-diffusion-v1-5"
+VAE_MODEL  = "stabilityai/sd-vae-ft-mse"
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE      = torch.float16 if torch.cuda.is_available() else torch.float32
 
@@ -56,8 +54,7 @@ def main() -> None:
 
     print("Loading VAE…")
     vae = AutoencoderKL.from_pretrained(
-        BASE_MODEL,
-        subfolder="vae",
+        VAE_MODEL,
         torch_dtype=DTYPE,
         cache_dir=CACHE_DIR,
     ).to(DEVICE).eval()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import random
 import time
 
@@ -223,10 +224,9 @@ class TrainConfig:
     epochs: int = 3
     lr: float = 1e-3             # ok since only the tiny fusion MLP is trained
     weight_decay: float = 1e-4
-    # for ai dataset
-    # pt_dir: str = "pt"
-    # for real dataset
-    pt_dir: str = "pt_flickr"
+    pt_dir: str = "pt_combined"
+    csv_flickr: str = "train_flickr.csv"
+    csv_ai: str = "train_ai.csv"
     # num_inference_train_timesteps: int = 1000   # only 1 random t sampled per step — cost is fine
     max_grad_norm: float = 1.0
     # save_every_steps: int = 500   # counted in optimizer steps (post-accumulation)
@@ -437,18 +437,54 @@ def train(cfg: TrainConfig) -> None:
     fusion_mlp.pretty_print(temperature=cfg.fusion_temperature)
 
     scheduler = DDIMScheduler.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
+        "sd-legacy/stable-diffusion-v1-5",
         subfolder="scheduler",
     )
 
-    dataset = PrecomputedDataset(pt_dir=cfg.pt_dir)
-    n_eval = max(1, int(len(dataset) * 0.2))
-    n_train = len(dataset) - n_eval
-    train_dataset, eval_dataset = torch.utils.data.random_split(
-        dataset, [n_train, n_eval],
+    def stems_from_csv(csv_path: str) -> set[str]:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            return {Path(row["image_path"]).stem for row in csv.DictReader(f)}
+
+    full_dataset = PrecomputedDataset(pt_dir=cfg.pt_dir)
+
+    flickr_stems = stems_from_csv(cfg.csv_flickr)
+    ai_stems     = stems_from_csv(cfg.csv_ai)
+
+    flickr_indices = [i for i, (stem, *_) in enumerate(full_dataset.samples) if stem in flickr_stems]
+    ai_indices     = [i for i, (stem, *_) in enumerate(full_dataset.samples) if stem in ai_stems]
+
+    subset_flickr = torch.utils.data.Subset(full_dataset, flickr_indices)
+    subset_ai     = torch.utils.data.Subset(full_dataset, ai_indices)
+
+    def split_80_20(ds):
+        n_eval = max(1, int(len(ds) * 0.2))
+        n_train = len(ds) - n_eval
+        return torch.utils.data.random_split(
+            ds, [n_train, n_eval],
+            generator=torch.Generator().manual_seed(cfg.seed),
+        )
+
+    train_flickr, eval_flickr = split_80_20(subset_flickr)
+    train_ai,     eval_ai     = split_80_20(subset_ai)
+
+    # Balance eval 50/50
+    n_eval_each = min(len(eval_flickr), len(eval_ai))
+    eval_flickr_bal, _ = torch.utils.data.random_split(
+        eval_flickr, [n_eval_each, len(eval_flickr) - n_eval_each],
         generator=torch.Generator().manual_seed(cfg.seed),
     )
-    print(f"Dataset split: {n_train} train / {n_eval} eval samples")
+    eval_ai_bal, _ = torch.utils.data.random_split(
+        eval_ai, [n_eval_each, len(eval_ai) - n_eval_each],
+        generator=torch.Generator().manual_seed(cfg.seed),
+    )
+
+    train_dataset = torch.utils.data.ConcatDataset([train_flickr, train_ai])
+    eval_dataset  = torch.utils.data.ConcatDataset([eval_flickr_bal, eval_ai_bal])
+    print(
+        f"Dataset split: {len(train_dataset)} train "
+        f"({len(train_flickr)} flickr + {len(train_ai)} AI) / "
+        f"{len(eval_dataset)} eval ({n_eval_each} flickr + {n_eval_each} AI)"
+    )
     print(f"Eval timestep is fixed at t={cfg.eval_timestep}\n")
 
     eval_loader = DataLoader(
