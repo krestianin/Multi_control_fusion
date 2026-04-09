@@ -102,12 +102,12 @@ def main():
     # -----------------------------
     # User settings
     # -----------------------------
-    image_path = "village.png"   # replace with your control/source image
-    prompt = "a realistic cinematic street scene"
-    output_path = "generated_learned_fusion.png"
-    fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_best.pth"  # set to None to fall back to fixed weights
+    image_path = "soldier.png"   # replace with your control/source image
+    prompt = "walking toy soldiers"  
+    output_path = "20_last_model_soldier.png"
+    fusion_mlp_path = "fusion_mlp_ckpts/fusion_mlp_last.pth"  # set to None to fall back to fixed weights
 
-    num_inference_steps = 30
+    num_inference_steps = 90
     guidance_scale = 7.5
     height = 512
     width = 512
@@ -190,6 +190,7 @@ def main():
     # -----------------------------
     latent_h = height // 8
     latent_w = width // 8
+    torch.manual_seed(42)
     latents = torch.randn((1, 4, latent_h, latent_w), device=device, dtype=dtype)
     latents = latents * scheduler.init_noise_sigma
 
@@ -225,8 +226,10 @@ def main():
 
         if step_idx == 0 and fused.fusion_weights is not None:
             weights_cpu = fused.fusion_weights.detach().float().cpu()
-            print("Learned per-layer fusion weights:")
-            for j, pair in enumerate(weights_cpu):
+            # weights_cpu is [J, 2] (static) or [B, J, 2] (image-dependent)
+            w = weights_cpu[1] if weights_cpu.dim() == 3 else weights_cpu  # [J, 2] — index 1 = conditional sample
+            print("Learned per-layer fusion weights (conditional sample):")
+            for j, pair in enumerate(w):
                 print(f"  layer {j:02d}: canny={pair[0]:.4f}, depth={pair[1]:.4f}")
 
         print(f"Step {step_idx + 1}/{num_inference_steps} done")

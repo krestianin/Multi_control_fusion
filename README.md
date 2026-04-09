@@ -15,3 +15,9 @@ Remove-Item -Path "$env:USERPROFILE\.cache\huggingface\hub" -Recurse -Force
 
 # Clear local models
 Remove-Item -Path "models" -Recurse -Force
+
+
+# Datasets
+python precompute_controls.py   # canny + depth (if not done yet)
+python precompute_latents.py    # latents + text embeddings
+python train_fusion_mlp.py

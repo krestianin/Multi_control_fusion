@@ -6,3 +6,13 @@ __pycache__/
 
 # vscode
 .vscode/
+
+diffusiondb/
+data/
+pt/
+pt_flickr/
+fusion_mlp_ckpts/
+models/
+flickr*/
+
+*.png
