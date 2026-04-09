@@ -138,7 +138,7 @@ class LearnedPerLayerFusion(nn.Module):
 
         num_down = len(canny_out.down_block_res_samples)
 
-        # ── Build context and get weights ────────────────────────────────────
+        # Build context and get weights 
         context = None
         if self.context_encoder is not None:
             B = sample.shape[0]
@@ -180,7 +180,7 @@ class LearnedPerLayerFusion(nn.Module):
                 f"but ControlNet produced {expected_points}"
             )
 
-        # ── Apply fusion weights ─────────────────────────────────────────────
+        # Apply fusion weights 
         batched = context is not None
         B = sample.shape[0]
 
@@ -219,17 +219,15 @@ class LearnedPerLayerFusion(nn.Module):
 @dataclass
 class TrainConfig:
     output_dir: str = "fusion_mlp_ckpts"
-    batch_size: int = 1          # 32 will OOM; use 1 for <8 GB VRAM, 2-4 for 12-16 GB
+    batch_size: int = 16                   # optimal for FIR         
     gradient_accumulation_steps: int = 1   # effective batch = batch_size × accum_steps
-    epochs: int = 3
-    lr: float = 1e-3             # ok since only the tiny fusion MLP is trained
+    epochs: int = 40
+    lr: float = 1e-3        
     weight_decay: float = 1e-4
     pt_dir: str = "pt_combined"
     csv_flickr: str = "train_flickr.csv"
     csv_ai: str = "train_ai.csv"
-    # num_inference_train_timesteps: int = 1000   # only 1 random t sampled per step — cost is fine
     max_grad_norm: float = 1.0
-    # save_every_steps: int = 500   # counted in optimizer steps (post-accumulation)
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
@@ -380,14 +378,6 @@ def evaluate(fusion: LearnedPerLayerFusion, fusion_mlp: PerLayerFusionMLP,
 
             print(f"eval_step={total_steps} stem={stems[0]} timestep={timesteps[0].item()}")
 
-            # if cfg.log_sample_weights and fused.fusion_weights is not None:
-            #     weights_to_print = fused.fusion_weights[0] if fused.fusion_weights.dim() == 3 else fused.fusion_weights
-                # print("sample-conditioned fusion weights:")
-                # for j, pair in enumerate(weights_to_print.detach().cpu()):
-                #     canny_w, depth_w = pair.tolist()
-                #     print(f"layer {j:02d}: canny={canny_w:.4f}, depth={depth_w:.4f}")
-
-
             if cfg.max_batches is not None and total_steps >= cfg.max_batches:
                 break
 
@@ -518,7 +508,7 @@ def train(cfg: TrainConfig) -> None:
     accum_loss = 0.0         # running sum for logging
     best_loss = float("inf")
 
-    # ----- profiling timers (seconds, accumulated across batches) -----
+    # profiling timers (seconds, accumulated across batches) 
     use_cuda = cfg.device == "cuda"
     _T = {"dataloader": 0.0, "to_device": 0.0, "fusion": 0.0, "unet": 0.0, "backward_optim": 0.0, "backward": 0.0, "optim": 0.0}
     batches_timed = 0
@@ -537,7 +527,7 @@ def train(cfg: TrainConfig) -> None:
 
         loader_iter = iter(loader)
         while True:
-            # ── 1. DataLoader fetch ──────────────────────────────────────
+            # 1. DataLoader fetch 
             _sync()
             t0 = time.perf_counter()
             try:
@@ -550,7 +540,7 @@ def train(cfg: TrainConfig) -> None:
             batch_size = latents.shape[0]
             batches_timed += 1
 
-            # ── 2. .to(device) ───────────────────────────────────────────
+            # 2. .to(device)
             _sync()
             t0 = time.perf_counter()
             canny_cond            = canny_cond.to(device=cfg.device, dtype=cfg.dtype)
@@ -570,7 +560,7 @@ def train(cfg: TrainConfig) -> None:
             )
             noisy_latents = scheduler.add_noise(latents, noise, timesteps)
 
-            # ── 3. Fusion ControlNet calls ───────────────────────────────
+            # 3. Fusion ControlNet calls 
             _sync()
             t0 = time.perf_counter()
             fused = fusion(
@@ -583,7 +573,7 @@ def train(cfg: TrainConfig) -> None:
             _sync()
             _T["fusion"] += time.perf_counter() - t0
 
-            # ── 4. U-Net forward ─────────────────────────────────────────
+            # 4. U-Net forward 
             _sync()
             t0 = time.perf_counter()
             noise_pred = parts["unet"](
@@ -597,11 +587,7 @@ def train(cfg: TrainConfig) -> None:
             _sync()
             _T["unet"] += time.perf_counter() - t0
 
-            # ── 5. Backward + optimizer step ─────────────────────────────
-            # _sync()
-            # t0 = time.perf_counter()
-            # Divide loss so that the sum over accumulation steps ≈ a single
-            # large-batch loss (same scale regardless of accum window size).
+            # 5. Backward 
             _sync()
             t1 = time.perf_counter()
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
@@ -613,6 +599,7 @@ def train(cfg: TrainConfig) -> None:
             accum_step += 1
 
             if accum_step % cfg.gradient_accumulation_steps == 0:
+                # 6. optimizer step 
                 _sync()
                 t1 = time.perf_counter()
                 torch.nn.utils.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
@@ -634,15 +621,6 @@ def train(cfg: TrainConfig) -> None:
                     f"stem={stems[0]}"
                 )
 
-                # if avg_loss < best_loss:
-                #     best_loss = avg_loss
-                #     fusion_mlp.save(output_dir / "fusion_mlp_best.pth")
-
-                # if global_step % cfg.save_every_steps == 0:
-                #     fusion_mlp.save(output_dir / f"fusion_mlp_step_{global_step}.pth")
-            # _sync()
-            # _T["backward_optim"] += time.perf_counter() - t0
-
             if cfg.max_batches is not None and batches_timed >= cfg.max_batches:
                 print(f"[profiling] reached max_batches={cfg.max_batches}, stopping early")
                 break
@@ -654,7 +632,7 @@ def train(cfg: TrainConfig) -> None:
         fusion_mlp.pretty_print(temperature=cfg.fusion_temperature)
         save_checkpoint(output_dir / f"fusion_mlp_epoch_{epoch + 1}.pth", fusion_mlp, context_encoder)
 
-    # ── Timing summary ───────────────────────────────────────────────────────
+    # Timing summary
     n = max(batches_timed, 1)
     total = sum(_T.values())
     print(f"\n{'─'*55}")
@@ -677,7 +655,4 @@ def train(cfg: TrainConfig) -> None:
 
 
 if __name__ == "__main__":
-    train(TrainConfig(
-        batch_size=1,
-        lr=1e-3,
-    ))
+    train(TrainConfig())

@@ -44,10 +44,10 @@ class ContextEncoder(nn.Module):
 
     Four branches (each projected to proj_dim with a SiLU activation):
 
-        timestep   – sinusoidal embedding of the diffusion timestep
-        text       – mean-pooled CLIP encoder hidden states
-        canny_feat – globally-pooled first ControlNet down-block feature
-        depth_feat – globally-pooled first ControlNet down-block feature
+        timestep   - sinusoidal embedding of the diffusion timestep
+        text       - mean-pooled CLIP encoder hidden states
+        canny_feat - globally-pooled first ControlNet down-block feature
+        depth_feat - globally-pooled first ControlNet down-block feature
 
     Output: [B, context_dim] where context_dim = 4 * proj_dim = 256 by default.
 
@@ -109,13 +109,11 @@ class PerLayerFusionMLP(nn.Module):
     """
     Lightweight MLP for learned per-injection-point fusion.
 
-    Static mode (context_dim == 0, default)
-    ----------------------------------------
+    Static mode (context_dim == 0, default):
     Input:  injection index embedding  [J, index_emb_dim]
     Output: fusion weights             [J, 2]  (canny, depth)
 
-    Image-dependent mode (context_dim > 0)
-    ----------------------------------------
+    Image-dependent mode (context_dim > 0):
     Input:  index embedding + context  [B, J, index_emb_dim + context_dim]
     Output: per-sample fusion weights  [B, J, 2]
 
@@ -163,8 +161,6 @@ class PerLayerFusionMLP(nn.Module):
         self.out_proj = nn.Linear(in_dim, 2)
         nn.init.zeros_(self.out_proj.weight) # to make initial fusion = simple average of canny/depth (after softmax)
         nn.init.constant_(self.out_proj.bias, 0.0)  
-        # nn.init.zeros_(self.out_proj.weight) # to make initial fusion = simple average of canny/depth (after softmax)
-        # nn.init.zeros_(self.out_proj.bias)
 
 
     def forward(

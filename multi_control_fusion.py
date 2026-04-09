@@ -26,7 +26,7 @@ class FusedControlOutput:
 
 class LearnedWeightMultiControlFusion(nn.Module):
     """
-    Run two frozen ControlNets and fuse their outputs with either:
+    Runs two frozen ControlNets and fuses their outputs with either:
       - learned per-sample weights from a trained MLP + ContextEncoder, or
       - static learned weights (MLP only, no context encoder), or
       - fixed fallback weights.
@@ -151,7 +151,7 @@ class LearnedWeightMultiControlFusion(nn.Module):
         num_down = len(canny_out.down_block_res_samples)
         B = sample.shape[0]
 
-        # ── Get fusion weights ───────────────────────────────────────────────
+        # Get fusion weights 
         if self.fusion_mlp is None:
             # Fixed fallback weights: [J, 2]
             num_inj = num_down + 1
@@ -189,7 +189,7 @@ class LearnedWeightMultiControlFusion(nn.Module):
 
         batched = weights.dim() == 3  # True when context encoder was used
 
-        # ── Apply weights ────────────────────────────────────────────────────
+        # Apply weights 
         fused_down = []
         for j, (c_res, d_res) in enumerate(
             zip(canny_out.down_block_res_samples, depth_out.down_block_res_samples)
@@ -218,6 +218,3 @@ class LearnedWeightMultiControlFusion(nn.Module):
             fusion_weights=weights,  # [J, 2] or [B, J, 2]
         )
 
-
-# Backward-compatible alias so older imports do not break.
-EqualWeightMultiControlFusion = LearnedWeightMultiControlFusion

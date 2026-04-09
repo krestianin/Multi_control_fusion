@@ -131,7 +131,7 @@ def main():
     canny_image_path = "rug.png"   # image used to extract Canny control
     depth_image_path = "rug.png"   # image used to extract Depth control
     prompt = "room"  # text prompt
-    fusion_mlp_path = N#"fusion_mlp_epoch_400_sigmoid_updated.pth"  # set to None to fall back to fixed weights
+    fusion_mlp_path = "fusion_mlp_epoch_400_sigm.pth"  # set to None to fall back to fixed weights
 
     # -----------------------------
     # Build output folder
@@ -175,8 +175,8 @@ def main():
         fusion_mlp_path=fusion_mlp_path,
         map_location=device,
         temperature=1.0,
-        fallback_canny_weight=1,
-        fallback_depth_weight=0,
+        fallback_canny_weight=1, # Set to 1 to use only Canny if no learned fusion; set to 0 to disable fully
+        fallback_depth_weight=0, # Set to 1 to use only Depth if no learned fusion; set to 0 to disable fully
         validate_shapes_once=True,
     ).to(device)
 
